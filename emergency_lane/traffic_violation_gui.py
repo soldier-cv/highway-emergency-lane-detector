@@ -18,6 +18,7 @@ from pathlib import Path
 # ============ 核心检测逻辑 ============
 
 from models.config import YOLO_MODEL_PATH, YOLO_DEVICE, PROJECT_ROOT
+from gpu_backend import get_gpu_backend
 
 
 def _get_project_root():
@@ -39,8 +40,13 @@ def init_hyperlpr3():
     """初始化车牌识别（OpenVINO GPU加速版）"""
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from lpr3_openvino import LicensePlateCatcherOV
-        catcher = LicensePlateCatcherOV(device="GPU", det_level=1)
+        gpu = get_gpu_backend()
+        if gpu.cuda_available:
+            from lpr3_ort import LicensePlateCatcherORT
+            catcher = LicensePlateCatcherORT(det_level=1)
+        else:
+            from lpr3_openvino import LicensePlateCatcherOV
+            catcher = LicensePlateCatcherOV(device="GPU", det_level=1)
         return catcher
     except Exception as e:
         # 回退到原版CPU

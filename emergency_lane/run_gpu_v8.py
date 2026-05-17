@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import compute_overlap, compute_iou, format_tc, fix_json_types
 from models.config import YOLO_MODEL_PATH, YOLO_DEVICE
+from gpu_backend import get_gpu_backend
 
 # =============================================
 # 配置
@@ -202,16 +203,22 @@ if YOLO_MODEL_PATH is None:
     print("  ❌ 未找到模型文件！请确保项目根目录下有 yolov8s.pt 或 yolov8s_openvino_model/")
     print("     或运行: python setup_models.py")
     sys.exit(1)
+gpu = get_gpu_backend()
 yolo = YOLO(YOLO_MODEL_PATH, task="detect")
-_yolo_device = YOLO_DEVICE
+_yolo_device = gpu.yolo_device
 dummy = np.zeros((848, 1920, 3), dtype=np.uint8)
 for _ in range(5):
     yolo.predict(dummy, conf=0.25, device=_yolo_device, classes=[2,3,5,7], verbose=False)
 print(f"  YOLOv8s {_yolo_device} ready")
 
-from lpr3_openvino import LicensePlateCatcherOV
-plate_catcher = LicensePlateCatcherOV(device="GPU", det_level=1)
-print("  HyperLPR3 OpenVINO GPU ready")
+if gpu.cuda_available:
+    from lpr3_ort import LicensePlateCatcherORT
+    plate_catcher = LicensePlateCatcherORT(det_level=1)
+    print("  HyperLPR3 ONNXRuntime CUDA ready")
+else:
+    from lpr3_openvino import LicensePlateCatcherOV
+    plate_catcher = LicensePlateCatcherOV(device="GPU", det_level=1)
+    print("  HyperLPR3 OpenVINO GPU ready")
 
 # =============================================
 # 2. 检测违章车辆（只检测，不识别）

@@ -4,12 +4,12 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 ultralytics>=8.0.0
 
-# OpenVINO (Intel GPU加速)
-openvino>=2024.0.0
+# GPU加速 (NVIDIA CUDA)
+torch>=2.0.0
+onnxruntime-gpu>=1.17.0
 
-# 车牌识别 (HyperLPR3 OpenVINO版)
-# 需要从源码安装: cd lpr3_openvino && pip install -e .
-# 或使用预编译包 (如果有的话)
+# GPU加速 (Intel OpenVINO, 备选)
+openvino>=2024.0.0
 
 # 工具
 Pillow>=10.0.0
