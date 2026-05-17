@@ -597,16 +597,25 @@ def run_detection(video_path, lane_x=0.84, lane_width=0.16, lane_top=0.15,
         'recognized_plates': sum(1 for r in results if r['plate'] != '未识别')
     }
 
-def generate_html_report(results, video_path, output_dir, video_name, lane_x, lane_width, lane_top, clips=None):
-    """生成HTML报告"""
+def generate_html_report(results, video_path, output_dir, video_name, lane_x, lane_width, lane_top, clips=None, base_url=None):
+    """生成HTML报告
+    base_url: 可选的基础URL前缀，用于Web服务模式（如 /task-files/{task_id}）
+              为None时使用相对路径（本地GUI模式）
+    """
     html_path = os.path.join(output_dir, f"{video_name}_violation_report.html")
 
     rows = ""
     for r in results:
         plate_color = "#27ae60" if r['plate'] != '未识别' else "#e74c3c"
         snap = r.get('snapshot', '')
-        # 使用相对路径，确保HTML能正确引用截图
-        snap_rel = os.path.relpath(snap, output_dir) if snap else ''
+        if snap and os.path.exists(snap):
+            if base_url:
+                snap_href = f"{base_url}/{os.path.relpath(snap, output_dir).replace(os.sep, '/')}"
+            else:
+                snap_href = os.path.relpath(snap, output_dir)
+            snap_link = f'<a href="{snap_href}" target="_blank">查看截图</a>'
+        else:
+            snap_link = '-'
 
         # 片段信息
         clip_info = ""
@@ -620,7 +629,7 @@ def generate_html_report(results, video_path, output_dir, video_name, lane_x, la
             <td>{r['time']}</td>
             <td>{r['confidence']:.0%}</td>
             <td>{clip_info if clip_info else '-'}</td>
-            <td>{'<a href="' + snap_rel + '" target="_blank">查看</a>' if snap_rel else '-'}</td>
+            <td>{snap_link}</td>
         </tr>"""
 
     # 剪辑片段表格
@@ -631,11 +640,14 @@ def generate_html_report(results, video_path, output_dir, video_name, lane_x, la
             # 计算该片段包含的违章
             clip_violations = [v for v in results if v.get('clip_label') == clip['label']]
             plates_str = ", ".join(set(v['plate'] for v in clip_violations if v['plate'] != '未识别'))
-            clip_file_rel = f"{clips_dir_name}/{clip['filename']}"
+            if base_url:
+                clip_href = f"{base_url}/{clips_dir_name}/{clip['filename']}"
+            else:
+                clip_href = f"{clips_dir_name}/{clip['filename']}"
             clips_html += f"""
         <tr>
             <td>{clip['index']}</td>
-            <td><a href="{clip_file_rel}" target="_blank">{clip['filename']}</a></td>
+            <td><a href="{clip_href}" target="_blank">{clip['filename']}</a></td>
             <td>{clip['start']:.0f}s - {clip['end']:.0f}s</td>
             <td>{clip['duration']:.0f}s</td>
             <td style="color:#c00;font-weight:bold;">{plates_str or '-'}</td>

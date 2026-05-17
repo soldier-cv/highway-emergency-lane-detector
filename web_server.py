@@ -103,18 +103,24 @@ def load_tasks_from_disk():
             result = None
             if html_files:
                 try:
-                    # 扫描结果文件
+                    # 扫描结果文件（排除原始视频和隐藏文件）
+                    video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv'}
                     result_files = []
                     for root, dirs, files in os.walk(task_path):
                         for file in files:
+                            if file.startswith('.'):
+                                continue
+                            if Path(file).suffix.lower() in video_exts:
+                                # 跳过位于任务根目录的原始视频
+                                if os.path.dirname(os.path.join(root, file)) == str(task_path):
+                                    continue
                             file_path = os.path.join(root, file)
-                            rel_path = os.path.relpath(file_path, task_path)
-                            if not file.startswith('.'):
-                                result_files.append({
-                                    'name': file,
-                                    'path': rel_path,
-                                    'size': os.path.getsize(file_path)
-                                })
+                            rel_path = os.path.relpath(file_path, task_path).replace('\\', '/')
+                            result_files.append({
+                                'name': file,
+                                'path': rel_path,
+                                'size': os.path.getsize(file_path)
+                            })
 
                     clips_dir = task_path / "举报视频片段"
                     clips_count = len(list(clips_dir.glob('*.mp4'))) if clips_dir.exists() else 0
@@ -198,12 +204,17 @@ def run_detection_task(task_id, video_path, task_dir, params):
 
         # 移动截图目录
         snapshot_src = result.get('snapshot_dir', '')
+        snapshot_dst = os.path.join(task_dir, f"{video_stem}_snapshots")
         if snapshot_src and os.path.exists(snapshot_src):
-            snapshot_dst = os.path.join(task_dir, f"{video_stem}_snapshots")
             if snapshot_src != snapshot_dst:
                 if os.path.exists(snapshot_dst):
                     shutil.rmtree(snapshot_dst)
                 shutil.move(snapshot_src, snapshot_dst)
+        # 更新截图路径
+        for v in result.get('violations', []):
+            old_snap = v.get('snapshot', '')
+            if old_snap:
+                v['snapshot'] = os.path.join(snapshot_dst, os.path.basename(old_snap))
 
         # 移动视频片段目录
         clips_src = os.path.join(os.path.dirname(video_path), "举报视频片段")
@@ -224,14 +235,28 @@ def run_detection_task(task_id, video_path, task_dir, params):
             if os.path.exists(cleanup_dir):
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
 
-        # 生成结果文件列表
+        # 重新生成HTML报告（使用Web服务URL，确保截图和视频链接正确）
+        from traffic_violation_gui import generate_html_report
+        base_url = f"/task-files/{task_id}"
+        html_report_path = os.path.join(task_dir, f"{video_stem}_violation_report.html")
+        generate_html_report(
+            result['violations'], dest_video, task_dir, video_stem,
+            params.get('lane_x', 0.84), params.get('lane_width', 0.16),
+            params.get('lane_top', 0.15), result.get('clips', []),
+            base_url=base_url
+        )
+
+        # 生成结果文件列表（排除原始视频）
+        video_filenames = {video_name, os.path.basename(video_path)}
         result_files = []
         for root, dirs, files in os.walk(task_dir):
             for file in files:
                 if file.startswith('.'):
                     continue
+                if file in video_filenames:
+                    continue
                 file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, task_dir)
+                rel_path = os.path.relpath(file_path, task_dir).replace('\\', '/')
                 result_files.append({
                     'name': file,
                     'path': rel_path,
@@ -372,6 +397,20 @@ def sse_events(task_id):
     return Response(generate(), mimetype='text/event-stream')
 
 
+@app.route('/task-files/<task_id>/<path:filename>')
+def serve_task_file(task_id, filename):
+    """提供任务文件的静态访问（用于HTML报告中的截图和视频片段链接）"""
+    task = tasks.get(task_id)
+    if not task:
+        return jsonify({'error': '任务不存在'}), 404
+
+    file_path = os.path.join(task['task_dir'], filename)
+    if not os.path.exists(file_path) or os.path.isdir(file_path):
+        return jsonify({'error': '文件不存在'}), 404
+
+    return send_file(file_path)
+
+
 @app.route('/api/download/<task_id>/<path:filename>')
 def download_file(task_id, filename):
     task = tasks.get(task_id)
@@ -398,19 +437,37 @@ def download_all(task_id):
     if not os.path.exists(task_dir):
         return jsonify({'error': '结果目录不存在'}), 404
 
+    # 排除原始视频文件（体积大，不属于检测结果）
+    original_video = os.path.basename(task.get('video_path', ''))
+    video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv'}
+
     memory_file = io.BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(task_dir):
             for file in files:
                 if file.startswith('.'):
                     continue
+                # 跳过任务根目录下的原始视频
+                if file == original_video and os.path.abspath(root) == os.path.abspath(task_dir):
+                    continue
+                if Path(file).suffix.lower() in video_exts and os.path.abspath(root) == os.path.abspath(task_dir):
+                    continue
                 file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, task_dir)
+                arcname = os.path.relpath(file_path, task_dir).replace('\\', '/')
                 zf.write(file_path, arcname)
 
     memory_file.seek(0)
-    filename = f"检测结果_{task['original_name']}_{task_id}.zip"
-    return send_file(memory_file, mimetype='application/zip', as_attachment=True, download_name=filename)
+    # 使用ASCII安全的文件名，通过Content-Disposition的filename*参数传递UTF-8文件名
+    safe_filename = f"detection_result_{task_id}.zip"
+    utf8_filename = f"检测结果_{task_id}.zip"
+    response = send_file(memory_file, mimetype='application/zip', as_attachment=True, download_name=safe_filename)
+    # 添加RFC 5987编码的UTF-8文件名
+    from urllib.parse import quote
+    response.headers['Content-Disposition'] = (
+        f"attachment; filename={safe_filename}; "
+        f"filename*=UTF-8''{quote(utf8_filename)}"
+    )
+    return response
 
 
 @app.route('/api/history')

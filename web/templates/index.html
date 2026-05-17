@@ -657,6 +657,7 @@
                         <div class="flex items-center gap-2 flex-shrink-0 ml-4">
                             <span class="px-2.5 py-1 ${s.bg} ${s.text} rounded-full text-xs font-medium">${s.label}</span>
                             ${task.status === 'completed' ? `<button onclick="viewResult('${task.id}')" class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-morandi-100 transition-colors">查看</button>` : ''}
+                            ${task.status === 'completed' ? `<button onclick="downloadAll('${task.id}')" class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-morandi-100 transition-colors">下载</button>` : ''}
                             <button onclick="deleteTask('${task.id}')" class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-red-50 hover:border-red-300 hover:text-red-700 transition-colors">删除</button>
                         </div>
                     `;
@@ -724,6 +725,10 @@
             } catch (e) {
                 alert('获取结果失败');
             }
+        }
+
+        function downloadAll(taskId) {
+            window.location.href = `/api/download-all/${taskId}`;
         }
 
         async function deleteTask(taskId) {
