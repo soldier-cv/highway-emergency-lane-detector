@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 数据文件（检测结果、上传视频）
+data/
+web_uploads/
+web_results/
+web_history.json
+
+# 模型文件
+*.pt
+*.onnx
+*.pth
+*.weights
+yolov8s_openvino_model/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 生成的报告和截图
+**/violation_snapshots/
+**/debug_*.jpg
+**/*_检测结果/
+**/*_violation_report.html
+**/*_snapshots/
+demo_result.jpg
+test_detection_result.jpg
+demo_detections.json
+
+# Claude Code
+.claude/

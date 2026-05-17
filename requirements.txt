@@ -1,0 +1,19 @@
+# 高速公路应急车道违章检测系统 - 依赖
+# 核心
+opencv-python>=4.8.0
+numpy>=1.24.0
+ultralytics>=8.0.0
+
+# OpenVINO (Intel GPU加速)
+openvino>=2024.0.0
+
+# 车牌识别 (HyperLPR3 OpenVINO版)
+# 需要从源码安装: cd lpr3_openvino && pip install -e .
+# 或使用预编译包 (如果有的话)
+
+# 工具
+Pillow>=10.0.0
+pyyaml>=6.0
+
+# Web界面 (可选)
+flask>=3.0.0

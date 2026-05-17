@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>应急车道违章检测系统</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚨</text></svg>">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        morandi: {
+                            50: '#f6f7f4',
+                            100: '#e8ebe3',
+                            200: '#d4d9ca',
+                            300: '#b5bda6',
+                            400: '#9aa585',
+                            500: '#7d8a68',
+                            600: '#636e52',
+                            700: '#4d5642',
+                            800: '#404738',
+                            900: '#373d31',
+                            950: '#1c2018',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #e8ebe3 0%, #d4d9ca 50%, #b5bda6 100%);
+            min-height: 100vh;
+        }
+
+        .glass-card {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.5);
+        }
+
+        .upload-zone {
+            border: 2px dashed #b5bda6;
+            transition: all 0.3s ease;
+        }
+
+        .upload-zone:hover,
+        .upload-zone.dragover {
+            border-color: #7d8a68;
+            background: rgba(125, 138, 104, 0.05);
+            transform: scale(1.01);
+        }
+
+        .progress-bar {
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            background: #e8ebe3;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #7d8a68, #9aa585);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .progress-fill::after {
+            content: '';
+            display: block;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            animation: shimmer 2s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .pulse-dot {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .log-container {
+            background: #1c2018;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        }
+
+        .stat-card {
+            transition: all 0.2s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 24px rgba(0,0,0,0.1);
+        }
+
+        .file-item {
+            transition: all 0.2s ease;
+        }
+
+        .file-item:hover {
+            transform: translateX(4px);
+            background: #e8ebe3;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #7d8a68, #636e52);
+            transition: all 0.2s ease;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(125, 138, 104, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .fade-in {
+            animation: fadeIn 0.4s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        input[type="number"]:focus,
+        select:focus {
+            outline: none;
+            border-color: #7d8a68;
+            box-shadow: 0 0 0 3px rgba(125, 138, 104, 0.2);
+        }
+
+        .toggle-checkbox:checked {
+            background: linear-gradient(135deg, #7d8a68, #9aa585);
+        }
+
+        .toggle-checkbox:checked + .toggle-dot {
+            transform: translateX(100%);
+        }
+    </style>
+</head>
+<body class="p-4 md:p-6 lg:p-8">
+    <div class="max-w-6xl mx-auto">
+        <!-- 导航栏 -->
+        <nav class="glass-card rounded-2xl p-4 md:p-5 mb-5 flex flex-col md:flex-row items-center justify-between gap-4">
+            <div class="flex items-center gap-4">
+                <div class="w-12 h-12 bg-gradient-to-br from-morandi-600 to-morandi-700 rounded-xl flex items-center justify-center text-2xl shadow-lg">
+                    🚨
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold text-morandi-900">应急车道违章检测系统</h1>
+                    <p class="text-sm text-morandi-600">YOLOv8 + HyperLPR3 + OpenVINO GPU</p>
+                </div>
+            </div>
+            <div class="px-4 py-2 bg-morandi-100 rounded-full text-sm font-medium text-morandi-700">
+                内网访问 · 无需登录
+            </div>
+        </nav>
+
+        <!-- 上传区域 -->
+        <div class="glass-card rounded-2xl p-5 md:p-6 mb-5 fade-in">
+            <div class="flex items-center gap-3 mb-5 pb-4 border-b border-morandi-200">
+                <div class="w-10 h-10 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-lg flex items-center justify-center text-lg">
+                    📹
+                </div>
+                <h2 class="text-lg font-semibold text-morandi-900">上传视频</h2>
+            </div>
+
+            <div class="upload-zone rounded-xl p-8 md:p-12 text-center cursor-pointer" id="uploadZone">
+                <div class="w-16 h-16 mx-auto mb-4 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-2xl flex items-center justify-center text-3xl shadow-lg">
+                    📁
+                </div>
+                <h3 class="text-lg font-semibold text-morandi-800 mb-2">拖拽视频文件到此处，或点击选择</h3>
+                <p class="text-morandi-600 text-sm">支持常见视频格式，最大 2GB</p>
+                <div class="flex flex-wrap justify-center gap-2 mt-4">
+                    <span class="px-3 py-1 bg-morandi-100 rounded-full text-xs text-morandi-600">MP4</span>
+                    <span class="px-3 py-1 bg-morandi-100 rounded-full text-xs text-morandi-600">AVI</span>
+                    <span class="px-3 py-1 bg-morandi-100 rounded-full text-xs text-morandi-600">MKV</span>
+                    <span class="px-3 py-1 bg-morandi-100 rounded-full text-xs text-morandi-600">MOV</span>
+                    <span class="px-3 py-1 bg-morandi-100 rounded-full text-xs text-morandi-600">FLV</span>
+                </div>
+                <input type="file" id="fileInput" accept=".mp4,.avi,.mkv,.mov,.flv,.wmv" class="hidden">
+            </div>
+
+            <!-- 上传进度 -->
+            <div id="uploadProgress" class="hidden mt-4">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="uploadFill" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between mt-2 text-sm text-morandi-600">
+                    <span id="uploadText">上传中...</span>
+                    <span id="uploadPercent" class="font-semibold">0%</span>
+                </div>
+            </div>
+
+            <!-- 文件信息 -->
+            <div id="fileInfo" class="hidden mt-4 flex items-center gap-4 p-4 bg-morandi-50 rounded-xl">
+                <div class="w-12 h-12 bg-gradient-to-br from-morandi-400 to-morandi-500 rounded-xl flex items-center justify-center text-2xl">
+                    🎬
+                </div>
+                <div class="flex-1 min-w-0">
+                    <div id="fileName" class="font-semibold text-morandi-900 truncate"></div>
+                    <div id="fileSize" class="text-sm text-morandi-600"></div>
+                </div>
+                <button id="clearFile" class="px-4 py-2 border border-morandi-300 rounded-lg text-sm text-morandi-700 hover:bg-morandi-100 transition-colors">
+                    清除
+                </button>
+            </div>
+        </div>
+
+        <!-- 参数设置 -->
+        <div class="glass-card rounded-2xl p-5 md:p-6 mb-5 fade-in" id="paramsCard">
+            <div class="flex items-center gap-3 mb-5 pb-4 border-b border-morandi-200">
+                <div class="w-10 h-10 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-lg flex items-center justify-center text-lg">
+                    ⚙️
+                </div>
+                <h2 class="text-lg font-semibold text-morandi-900">检测参数</h2>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-5">
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">应急车道 X 位置</label>
+                    <input type="number" id="laneX" value="0.84" min="0" max="1" step="0.01"
+                           class="w-full px-4 py-2.5 border border-morandi-200 rounded-lg text-sm bg-white transition-all">
+                    <p class="text-xs text-morandi-500">0-1，车道左边界比例</p>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">车道宽度</label>
+                    <input type="number" id="laneWidth" value="0.16" min="0.01" max="0.5" step="0.01"
+                           class="w-full px-4 py-2.5 border border-morandi-200 rounded-lg text-sm bg-white transition-all">
+                    <p class="text-xs text-morandi-500">0.01-0.5</p>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">车道顶部 Y</label>
+                    <input type="number" id="laneTop" value="0.15" min="0" max="1" step="0.01"
+                           class="w-full px-4 py-2.5 border border-morandi-200 rounded-lg text-sm bg-white transition-all">
+                    <p class="text-xs text-morandi-500">0-1，忽略顶部区域</p>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">检测缩放</label>
+                    <select id="detectionScale" class="w-full px-4 py-2.5 border border-morandi-200 rounded-lg text-sm bg-white transition-all">
+                        <option value="0.25">0.25 (最快)</option>
+                        <option value="0.5" selected>0.5 (推荐)</option>
+                        <option value="0.75">0.75</option>
+                        <option value="1.0">1.0 (最精确)</option>
+                    </select>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">置信度阈值</label>
+                    <input type="number" id="confThreshold" value="0.5" min="0.1" max="1" step="0.05"
+                           class="w-full px-4 py-2.5 border border-morandi-200 rounded-lg text-sm bg-white transition-all">
+                    <p class="text-xs text-morandi-500">越低越灵敏</p>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-morandi-800">GPU 加速</label>
+                    <div class="flex items-center gap-3 mt-1">
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="useGpu" class="sr-only peer" checked>
+                            <div class="w-11 h-6 bg-morandi-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-morandi-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-morandi-500 peer-checked:to-morandi-600"></div>
+                        </label>
+                        <span class="text-sm text-morandi-700">Intel Arc GPU</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-6">
+                <button id="btnStart" disabled
+                        class="btn-primary px-8 py-3 rounded-xl text-white font-semibold flex items-center gap-2">
+                    <span>🔍</span> 开始检测
+                </button>
+            </div>
+        </div>
+
+        <!-- 检测进度 -->
+        <div id="progressCard" class="glass-card rounded-2xl p-5 md:p-6 mb-5 hidden">
+            <div class="flex items-center justify-between mb-5 pb-4 border-b border-morandi-200">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-lg flex items-center justify-center text-lg">
+                        ⏳
+                    </div>
+                    <h2 class="text-lg font-semibold text-morandi-900">检测进度</h2>
+                </div>
+                <span id="statusBadge" class="flex items-center gap-2 px-3 py-1.5 bg-morandi-100 rounded-full text-sm font-medium text-morandi-700">
+                    <span class="w-2 h-2 bg-morandi-500 rounded-full pulse-dot"></span>
+                    处理中
+                </span>
+            </div>
+
+            <div class="progress-bar mb-3">
+                <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+            </div>
+            <div class="flex justify-between text-sm mb-4">
+                <span id="progressMessage" class="text-morandi-700">准备中...</span>
+                <span id="progressPercent" class="font-bold text-morandi-800">0%</span>
+            </div>
+
+            <div class="log-container rounded-xl p-4 max-h-60 overflow-y-auto text-sm" id="logContainer">
+                <div class="text-morandi-400">[系统] 等待检测开始...</div>
+            </div>
+        </div>
+
+        <!-- 检测结果 -->
+        <div id="resultCard" class="glass-card rounded-2xl p-5 md:p-6 mb-5 hidden">
+            <div class="flex items-center justify-between mb-5 pb-4 border-b border-morandi-200">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-lg flex items-center justify-center text-lg">
+                        📊
+                    </div>
+                    <h2 class="text-lg font-semibold text-morandi-900">检测结果</h2>
+                </div>
+                <span class="flex items-center gap-2 px-3 py-1.5 bg-green-100 rounded-full text-sm font-medium text-green-700">
+                    <span class="w-2 h-2 bg-green-500 rounded-full"></span>
+                    已完成
+                </span>
+            </div>
+
+            <div id="resultStats" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6"></div>
+
+            <div class="flex items-center gap-3 mb-4 mt-6">
+                <div class="w-8 h-8 bg-morandi-100 rounded-lg flex items-center justify-center">📁</div>
+                <h3 class="font-semibold text-morandi-800">结果文件</h3>
+            </div>
+
+            <ul id="fileList" class="space-y-2 mb-6"></ul>
+
+            <div class="flex flex-wrap gap-3">
+                <button id="btnDownloadAll" class="px-6 py-3 bg-gradient-to-r from-morandi-600 to-morandi-700 text-white rounded-xl font-semibold flex items-center gap-2 hover:shadow-lg transition-all">
+                    <span>📦</span> 打包下载全部
+                </button>
+                <button id="btnNewTask" class="px-6 py-3 border-2 border-morandi-300 text-morandi-700 rounded-xl font-semibold flex items-center gap-2 hover:bg-morandi-50 transition-all">
+                    <span>🔄</span> 新建任务
+                </button>
+            </div>
+        </div>
+
+        <!-- 历史任务 -->
+        <div class="glass-card rounded-2xl p-5 md:p-6 mb-5 fade-in">
+            <div class="flex items-center gap-3 mb-5 pb-4 border-b border-morandi-200">
+                <div class="w-10 h-10 bg-gradient-to-br from-morandi-500 to-morandi-600 rounded-lg flex items-center justify-center text-lg">
+                    📋
+                </div>
+                <h2 class="text-lg font-semibold text-morandi-900">历史任务</h2>
+            </div>
+
+            <div id="taskList" class="space-y-3">
+                <div class="text-center py-12 text-morandi-500">
+                    <div class="text-4xl mb-3 opacity-50">📭</div>
+                    <p>暂无历史任务</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 页脚 -->
+        <footer class="text-center py-6 text-morandi-600 text-sm">
+            应急车道违章检测系统 v2.0 · YOLOv8s + HyperLPR3 + OpenVINO GPU
+        </footer>
+    </div>
+
+    <script>
+        const $ = id => document.getElementById(id);
+        let currentTaskId = null;
+        let selectedFile = null;
+        let eventSource = null;
+
+        // 工具函数
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatTime(isoString) {
+            if (!isoString) return '';
+            return new Date(isoString).toLocaleString('zh-CN');
+        }
+
+        function addLog(message, type = '') {
+            const line = document.createElement('div');
+            const colors = {
+                '': 'text-gray-300',
+                'success': 'text-green-400',
+                'error': 'text-red-400',
+                'info': 'text-blue-400'
+            };
+            line.className = colors[type] || colors[''];
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            $('logContainer').appendChild(line);
+            $('logContainer').scrollTop = $('logContainer').scrollHeight;
+        }
+
+        function getFileIcon(filename) {
+            if (filename.endsWith('.html')) return { icon: '📄', bg: 'bg-red-100' };
+            if (filename.endsWith('.json')) return { icon: '📋', bg: 'bg-blue-100' };
+            if (filename.match(/\.(jpg|jpeg|png)$/)) return { icon: '🖼️', bg: 'bg-green-100' };
+            if (filename.match(/\.(mp4|avi|mkv)$/)) return { icon: '🎬', bg: 'bg-purple-100' };
+            return { icon: '📁', bg: 'bg-morandi-100' };
+        }
+
+        // 上传区域
+        $('uploadZone').addEventListener('click', () => $('fileInput').click());
+
+        $('uploadZone').addEventListener('dragover', e => {
+            e.preventDefault();
+            $('uploadZone').classList.add('dragover');
+        });
+
+        $('uploadZone').addEventListener('dragleave', () => {
+            $('uploadZone').classList.remove('dragover');
+        });
+
+        $('uploadZone').addEventListener('drop', e => {
+            e.preventDefault();
+            $('uploadZone').classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) handleFileSelect(e.dataTransfer.files[0]);
+        });
+
+        $('fileInput').addEventListener('change', e => {
+            if (e.target.files.length > 0) handleFileSelect(e.target.files[0]);
+        });
+
+        $('clearFile').addEventListener('click', () => {
+            selectedFile = null;
+            $('fileInput').value = '';
+            $('fileInfo').classList.add('hidden');
+            $('btnStart').disabled = true;
+        });
+
+        function handleFileSelect(file) {
+            selectedFile = file;
+            $('fileName').textContent = file.name;
+            $('fileSize').textContent = formatSize(file.size);
+            $('fileInfo').classList.remove('hidden');
+            $('btnStart').disabled = false;
+        }
+
+        // 开始检测
+        $('btnStart').addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            $('btnStart').disabled = true;
+            $('btnStart').innerHTML = '<span class="animate-spin">⏳</span> 上传中...';
+            $('uploadProgress').classList.remove('hidden');
+
+            try {
+                const formData = new FormData();
+                formData.append('video', selectedFile);
+
+                const uploadResult = await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', '/api/upload');
+
+                    xhr.upload.onprogress = e => {
+                        if (e.lengthComputable) {
+                            const pct = Math.round(e.loaded / e.total * 100);
+                            $('uploadFill').style.width = pct + '%';
+                            $('uploadPercent').textContent = pct + '%';
+                            $('uploadText').textContent = `上传中... ${formatSize(e.loaded)} / ${formatSize(e.total)}`;
+                        }
+                    };
+
+                    xhr.onload = () => {
+                        if (xhr.status === 200) {
+                            resolve(JSON.parse(xhr.responseText));
+                        } else {
+                            reject(new Error(JSON.parse(xhr.responseText).error || '上传失败'));
+                        }
+                    };
+
+                    xhr.onerror = () => reject(new Error('网络错误'));
+                    xhr.send(formData);
+                });
+
+                currentTaskId = uploadResult.task_id;
+                $('uploadProgress').classList.add('hidden');
+                $('progressCard').classList.remove('hidden');
+                $('resultCard').classList.add('hidden');
+                $('logContainer').innerHTML = '';
+                addLog('视频上传成功，开始检测...', 'success');
+
+                const params = {
+                    lane_x: parseFloat($('laneX').value),
+                    lane_width: parseFloat($('laneWidth').value),
+                    lane_top: parseFloat($('laneTop').value),
+                    detection_scale: parseFloat($('detectionScale').value),
+                    conf_threshold: parseFloat($('confThreshold').value),
+                    use_gpu: $('useGpu').checked
+                };
+
+                const detectRes = await fetch(`/api/detect/${currentTaskId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(params)
+                });
+
+                if (!detectRes.ok) throw new Error((await detectRes.json()).error);
+                subscribeToEvents(currentTaskId);
+
+            } catch (error) {
+                addLog(`错误: ${error.message}`, 'error');
+                $('btnStart').disabled = false;
+                $('btnStart').innerHTML = '<span>🔍</span> 开始检测';
+                $('uploadProgress').classList.add('hidden');
+                alert(error.message);
+            }
+        });
+
+        function subscribeToEvents(taskId) {
+            if (eventSource) eventSource.close();
+            eventSource = new EventSource(`/api/events/${taskId}`);
+
+            eventSource.onmessage = e => {
+                const data = JSON.parse(e.data);
+                if (data.type === 'progress') {
+                    $('progressFill').style.width = data.progress + '%';
+                    $('progressPercent').textContent = data.progress + '%';
+                    $('progressMessage').textContent = data.message;
+                    addLog(data.message, data.progress >= 80 ? 'success' : '');
+                } else if (data.type === 'completed') {
+                    eventSource.close();
+                    onDetectionComplete(data.result);
+                } else if (data.type === 'error') {
+                    eventSource.close();
+                    onDetectionError(data.message);
+                }
+            };
+
+            eventSource.onerror = () => eventSource.close();
+        }
+
+        function onDetectionComplete(result) {
+            addLog('检测完成！', 'success');
+            $('progressCard').classList.add('hidden');
+            $('resultCard').classList.remove('hidden');
+
+            $('resultStats').innerHTML = `
+                <div class="stat-card bg-gradient-to-br from-red-50 to-red-100 rounded-xl p-4 text-center">
+                    <div class="text-2xl mb-2">🚨</div>
+                    <div class="text-2xl font-bold text-morandi-900">${result.total_violations}</div>
+                    <div class="text-xs text-morandi-600 mt-1">违章总数</div>
+                </div>
+                <div class="stat-card bg-gradient-to-br from-green-50 to-green-100 rounded-xl p-4 text-center">
+                    <div class="text-2xl mb-2">✅</div>
+                    <div class="text-2xl font-bold text-morandi-900">${result.recognized_plates}</div>
+                    <div class="text-xs text-morandi-600 mt-1">车牌识别</div>
+                </div>
+                <div class="stat-card bg-gradient-to-br from-purple-50 to-purple-100 rounded-xl p-4 text-center">
+                    <div class="text-2xl mb-2">🎬</div>
+                    <div class="text-2xl font-bold text-morandi-900">${result.clips_count}</div>
+                    <div class="text-xs text-morandi-600 mt-1">视频片段</div>
+                </div>
+                <div class="stat-card bg-gradient-to-br from-blue-50 to-blue-100 rounded-xl p-4 text-center">
+                    <div class="text-2xl mb-2">⏱️</div>
+                    <div class="text-2xl font-bold text-morandi-900">${result.total_time}s</div>
+                    <div class="text-xs text-morandi-600 mt-1">检测耗时</div>
+                </div>
+            `;
+
+            $('fileList').innerHTML = '';
+            result.files.forEach(file => {
+                const { icon, bg } = getFileIcon(file.name);
+                const li = document.createElement('li');
+                li.className = 'file-item flex items-center justify-between p-3 bg-morandi-50 rounded-xl';
+                li.innerHTML = `
+                    <div class="flex items-center gap-3 flex-1 min-w-0">
+                        <div class="w-10 h-10 ${bg} rounded-lg flex items-center justify-center text-lg flex-shrink-0">${icon}</div>
+                        <div class="min-w-0">
+                            <div class="font-medium text-sm text-morandi-900 truncate">${file.name}</div>
+                            <div class="text-xs text-morandi-500">${formatSize(file.size)}</div>
+                        </div>
+                    </div>
+                    <a href="/api/download/${currentTaskId}/${file.path}" download
+                       class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-morandi-100 transition-colors flex-shrink-0 ml-3">
+                        下载
+                    </a>
+                `;
+                $('fileList').appendChild(li);
+            });
+
+            $('btnStart').disabled = false;
+            $('btnStart').innerHTML = '<span>🔍</span> 开始检测';
+            loadHistory();
+        }
+
+        function onDetectionError(message) {
+            addLog(`检测失败: ${message}`, 'error');
+            $('progressCard').classList.add('hidden');
+            $('btnStart').disabled = false;
+            $('btnStart').innerHTML = '<span>🔍</span> 开始检测';
+            alert(`检测失败: ${message}`);
+        }
+
+        $('btnDownloadAll').addEventListener('click', () => {
+            if (currentTaskId) window.location.href = `/api/download-all/${currentTaskId}`;
+        });
+
+        $('btnNewTask').addEventListener('click', () => {
+            currentTaskId = null;
+            selectedFile = null;
+            $('fileInput').value = '';
+            $('fileInfo').classList.add('hidden');
+            $('progressCard').classList.add('hidden');
+            $('resultCard').classList.add('hidden');
+            $('btnStart').disabled = true;
+            $('btnStart').innerHTML = '<span>🔍</span> 开始检测';
+        });
+
+        async function loadHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const tasks = await res.json();
+
+                if (tasks.length === 0) {
+                    $('taskList').innerHTML = `
+                        <div class="text-center py-12 text-morandi-500">
+                            <div class="text-4xl mb-3 opacity-50">📭</div>
+                            <p>暂无历史任务</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                $('taskList').innerHTML = '';
+                tasks.forEach(task => {
+                    const statusMap = {
+                        'completed': { bg: 'bg-green-100', text: 'text-green-700', label: '已完成' },
+                        'processing': { bg: 'bg-blue-100', text: 'text-blue-700', label: '处理中' },
+                        'error': { bg: 'bg-red-100', text: 'text-red-700', label: '失败' },
+                        'uploaded': { bg: 'bg-morandi-100', text: 'text-morandi-700', label: '待检测' }
+                    };
+                    const s = statusMap[task.status] || statusMap['uploaded'];
+
+                    const div = document.createElement('div');
+                    div.className = 'flex items-center justify-between p-4 bg-morandi-50 rounded-xl';
+                    div.innerHTML = `
+                        <div class="flex-1 min-w-0">
+                            <div class="font-semibold text-morandi-900 truncate">${task.original_name}</div>
+                            <div class="text-xs text-morandi-500 mt-1">${formatTime(task.created_at)}</div>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0 ml-4">
+                            <span class="px-2.5 py-1 ${s.bg} ${s.text} rounded-full text-xs font-medium">${s.label}</span>
+                            ${task.status === 'completed' ? `<button onclick="viewResult('${task.id}')" class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-morandi-100 transition-colors">查看</button>` : ''}
+                            <button onclick="deleteTask('${task.id}')" class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-red-50 hover:border-red-300 hover:text-red-700 transition-colors">删除</button>
+                        </div>
+                    `;
+                    $('taskList').appendChild(div);
+                });
+            } catch (e) {
+                console.error('加载历史失败:', e);
+            }
+        }
+
+        async function viewResult(taskId) {
+            try {
+                const res = await fetch(`/api/status/${taskId}`);
+                const task = await res.json();
+                if (!task.result) return;
+
+                currentTaskId = taskId;
+                $('resultCard').classList.remove('hidden');
+
+                $('resultStats').innerHTML = `
+                    <div class="stat-card bg-gradient-to-br from-red-50 to-red-100 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">🚨</div>
+                        <div class="text-2xl font-bold text-morandi-900">${task.result.total_violations}</div>
+                        <div class="text-xs text-morandi-600 mt-1">违章总数</div>
+                    </div>
+                    <div class="stat-card bg-gradient-to-br from-green-50 to-green-100 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">✅</div>
+                        <div class="text-2xl font-bold text-morandi-900">${task.result.recognized_plates}</div>
+                        <div class="text-xs text-morandi-600 mt-1">车牌识别</div>
+                    </div>
+                    <div class="stat-card bg-gradient-to-br from-purple-50 to-purple-100 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">🎬</div>
+                        <div class="text-2xl font-bold text-morandi-900">${task.result.clips_count}</div>
+                        <div class="text-xs text-morandi-600 mt-1">视频片段</div>
+                    </div>
+                    <div class="stat-card bg-gradient-to-br from-blue-50 to-blue-100 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">⏱️</div>
+                        <div class="text-2xl font-bold text-morandi-900">${task.result.total_time}s</div>
+                        <div class="text-xs text-morandi-600 mt-1">检测耗时</div>
+                    </div>
+                `;
+
+                $('fileList').innerHTML = '';
+                task.result.files.forEach(file => {
+                    const { icon, bg } = getFileIcon(file.name);
+                    const li = document.createElement('li');
+                    li.className = 'file-item flex items-center justify-between p-3 bg-morandi-50 rounded-xl';
+                    li.innerHTML = `
+                        <div class="flex items-center gap-3 flex-1 min-w-0">
+                            <div class="w-10 h-10 ${bg} rounded-lg flex items-center justify-center text-lg flex-shrink-0">${icon}</div>
+                            <div class="min-w-0">
+                                <div class="font-medium text-sm text-morandi-900 truncate">${file.name}</div>
+                                <div class="text-xs text-morandi-500">${formatSize(file.size)}</div>
+                            </div>
+                        </div>
+                        <a href="/api/download/${taskId}/${file.path}" download
+                           class="px-3 py-1.5 border border-morandi-300 rounded-lg text-xs text-morandi-700 hover:bg-morandi-100 transition-colors flex-shrink-0 ml-3">
+                            下载
+                        </a>
+                    `;
+                    $('fileList').appendChild(li);
+                });
+
+                $('resultCard').scrollIntoView({ behavior: 'smooth' });
+            } catch (e) {
+                alert('获取结果失败');
+            }
+        }
+
+        async function deleteTask(taskId) {
+            if (!confirm('确定删除此任务？')) return;
+            try {
+                await fetch(`/api/task/${taskId}`, { method: 'DELETE' });
+                loadHistory();
+            } catch (e) {
+                alert('删除失败');
+            }
+        }
+
+        // 初始化
+        loadHistory();
+    </script>
+</body>
+</html>
