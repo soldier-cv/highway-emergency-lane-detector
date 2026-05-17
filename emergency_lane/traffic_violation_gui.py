@@ -196,7 +196,14 @@ def generate_violation_clips(video_path, violation_times, output_dir, progress_c
         progress_callback = lambda msg, pct: None
 
     import shutil as _shutil
-    if not _shutil.which('ffmpeg'):
+    _ffmpeg_cmd = _shutil.which('ffmpeg')
+    if not _ffmpeg_cmd:
+        # Fallback: 检查常见安装路径
+        for _candidate in [r'C:\ffmpeg6.0\bin\ffmpeg.exe', r'C:\ffmpeg\bin\ffmpeg.exe']:
+            if os.path.isfile(_candidate):
+                _ffmpeg_cmd = _candidate
+                break
+    if not _ffmpeg_cmd:
         progress_callback("  [ERROR] ffmpeg 未安装，无法生成视频片段。请安装 ffmpeg 并添加到 PATH。", -1)
         return []
 
@@ -267,7 +274,7 @@ def generate_violation_clips(video_path, violation_times, output_dir, progress_c
 
         import subprocess as _sp
         _result = _sp.run(
-            ['ffmpeg', '-y', '-ss', f'{start_sec:.2f}', '-i', video_path,
+            [_ffmpeg_cmd, '-y', '-ss', f'{start_sec:.2f}', '-i', video_path,
              '-t', f'{dur:.2f}', '-c', 'copy', clip_path],
             capture_output=True, text=True
         )
