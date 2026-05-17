@@ -195,6 +195,11 @@ def generate_violation_clips(video_path, violation_times, output_dir, progress_c
     if progress_callback is None:
         progress_callback = lambda msg, pct: None
 
+    import shutil as _shutil
+    if not _shutil.which('ffmpeg'):
+        progress_callback("  [ERROR] ffmpeg 未安装，无法生成视频片段。请安装 ffmpeg 并添加到 PATH。", -1)
+        return []
+
     clip_duration = 30       # 目标每段30秒
     pre_violation_pad = 3    # 违章前保留3秒
     min_gap_to_cut = 10      # 无违章超过10秒可剪掉
@@ -260,9 +265,14 @@ def generate_violation_clips(video_path, violation_times, output_dir, progress_c
         clip_filename = f"{label}_{start_sec:.0f}s-{end_sec:.0f}s_{dur:.0f}s.mp4"
         clip_path = os.path.join(clips_dir, clip_filename)
 
-        # 用FFmpeg直接剪切，不重新编码（速度快，保持原始画质）
-        ffmpeg_cmd = f'ffmpeg -y -ss {start_sec:.2f} -i "{video_path}" -t {dur:.2f} -c copy "{clip_path}"'
-        os.system(ffmpeg_cmd + " >nul 2>&1")
+        import subprocess as _sp
+        _result = _sp.run(
+            ['ffmpeg', '-y', '-ss', f'{start_sec:.2f}', '-i', video_path,
+             '-t', f'{dur:.2f}', '-c', 'copy', clip_path],
+            capture_output=True, text=True
+        )
+        if _result.returncode != 0:
+            progress_callback(f"  [WARN] FFmpeg failed for {clip_filename}: {_result.stderr[:200]}", -1)
 
         clip_results.append({
             'index': clip_idx + 1,

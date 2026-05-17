@@ -94,7 +94,7 @@ def load_tasks_from_disk():
 
             # 查找结果文件
             html_files = list(Path(task_path).glob('*_violation_report.html'))
-            snapshot_dirs = [d for d in task_path.iterdir() if d.is_dir() and d.name.endswith('_snapshots')]
+            snapshot_dirs = [d for d in Path(task_path).iterdir() if d.is_dir() and d.name.endswith('_snapshots')]
 
             original_name = video_files[0].name if video_files else task_dir
             status = 'completed' if html_files else 'uploaded'
@@ -226,14 +226,6 @@ def run_detection_task(task_id, video_path, task_dir, params):
                 if os.path.exists(clips_dst):
                     shutil.rmtree(clips_dst)
                 shutil.move(clips_src, clips_dst)
-
-        # 清理源目录残留
-        for cleanup_dir in [
-            os.path.join(os.path.dirname(video_path), f"{video_stem}_snapshots"),
-            os.path.join(os.path.dirname(video_path), f"{video_stem}_检测结果"),
-        ]:
-            if os.path.exists(cleanup_dir):
-                shutil.rmtree(cleanup_dir, ignore_errors=True)
 
         # 重新生成HTML报告（使用Web服务URL，确保截图和视频链接正确）
         from traffic_violation_gui import generate_html_report
