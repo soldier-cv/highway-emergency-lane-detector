@@ -1,57 +1,43 @@
 """
 统一模型路径配置
-优先使用项目本地 models/ 目录，回退到原有路径
+仅支持 YOLOv12 模型，优先使用项目本地 models/ 目录。
 自动检测 CUDA > OpenVINO > CPU
 """
 import os
+
+from gpu_backend import detect_cuda, detect_openvino_gpu, resolve_yolo_device
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 
-def _detect_cuda():
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        return False
-
-
-_CUDA_AVAILABLE = _detect_cuda()
+_CUDA_AVAILABLE, _, _ = detect_cuda()
+_OPENVINO_AVAILABLE = detect_openvino_gpu()
 
 
 if _CUDA_AVAILABLE:
     _YOLO_CANDIDATES = [
-        os.path.join(MODELS_DIR, "yolov8s.pt"),
-        os.path.join(PROJECT_ROOT, "yolov8s.pt"),
-        os.path.join(MODELS_DIR, "yolov8s_openvino_model"),
-        os.path.join(PROJECT_ROOT, "yolov8s_openvino_model"),
-        os.path.expanduser("~/.cache/modelscope/models/AI-ModelScope/YOLOv8/yolov8s.pt"),
-        os.path.expanduser("~/.cache/modelscope/models/AI-ModelScope/YOLOv8/yolov8s_openvino_model"),
+        os.path.join(MODELS_DIR, "yolo12s.pt"),
+        os.path.join(PROJECT_ROOT, "yolo12s.pt"),
+        os.path.join(MODELS_DIR, "yolo12s_openvino_model"),
+        os.path.join(PROJECT_ROOT, "yolo12s_openvino_model"),
     ]
 else:
     _YOLO_CANDIDATES = [
-        os.path.join(MODELS_DIR, "yolov8s_openvino_model"),
-        os.path.join(PROJECT_ROOT, "yolov8s_openvino_model"),
-        os.path.join(MODELS_DIR, "yolov8s.pt"),
-        os.path.join(PROJECT_ROOT, "yolov8s.pt"),
-        os.path.expanduser("~/.cache/modelscope/models/AI-ModelScope/YOLOv8/yolov8s_openvino_model"),
-        os.path.expanduser("~/.cache/modelscope/models/AI-ModelScope/YOLOv8/yolov8s.pt"),
+        os.path.join(MODELS_DIR, "yolo12s_openvino_model"),
+        os.path.join(PROJECT_ROOT, "yolo12s_openvino_model"),
+        os.path.join(MODELS_DIR, "yolo12s.pt"),
+        os.path.join(PROJECT_ROOT, "yolo12s.pt"),
     ]
 
 YOLO_MODEL_PATH = None
-YOLO_DEVICE = "cuda:0" if _CUDA_AVAILABLE else "cpu"
 
 for _p in _YOLO_CANDIDATES:
     if os.path.exists(_p):
         YOLO_MODEL_PATH = _p
-        if _CUDA_AVAILABLE:
-            YOLO_DEVICE = "cuda:0"
-        elif "openvino" in _p:
-            YOLO_DEVICE = "intel:GPU"
-        else:
-            YOLO_DEVICE = "cpu"
         break
+
+YOLO_DEVICE = resolve_yolo_device(YOLO_MODEL_PATH, cuda_available=_CUDA_AVAILABLE, openvino_available=_OPENVINO_AVAILABLE)
 
 
 _HYPERLPR3_LOCAL_DIR = os.path.join(MODELS_DIR, "onnx")

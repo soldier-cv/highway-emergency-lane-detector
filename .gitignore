@@ -25,6 +25,7 @@ web_history.json
 *.pth
 *.weights
 yolov8s_openvino_model/
+yolo12s_openvino_model/
 
 # IDE
 .vscode/
@@ -56,3 +57,4 @@ TASK.md
 *.pid
 # Web服务PID文件
 .web_server.pid
+*.log

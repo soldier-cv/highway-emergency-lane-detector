@@ -16,7 +16,7 @@ def detect_cuda():
         import torch
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             logger.info(f"CUDA可用: {gpu_name} ({gpu_mem:.1f}GB)")
             return True, gpu_name, gpu_mem
     except ImportError:
@@ -49,6 +49,26 @@ def detect_onnxruntime_providers():
         return []
 
 
+def is_openvino_model_path(model_path):
+    return bool(model_path) and "openvino" in str(model_path).lower()
+
+
+def resolve_yolo_device(model_path=None, cuda_available=None, openvino_available=None):
+    """根据模型格式和硬件能力选择YOLO设备"""
+    if cuda_available is None:
+        cuda_available, _, _ = detect_cuda()
+    if openvino_available is None:
+        openvino_available = detect_openvino_gpu()
+
+    if model_path and is_openvino_model_path(model_path):
+        return "intel:GPU" if openvino_available else "cpu"
+
+    if cuda_available:
+        return "cuda:0"
+
+    return "cpu"
+
+
 class GPUBackend:
     """统一GPU后端管理器"""
 
@@ -65,12 +85,8 @@ class GPUBackend:
 
         if force_device:
             self.yolo_device = self._resolve_force_device(force_device)
-        elif self.cuda_available:
-            self.yolo_device = "cuda:0"
-        elif self.openvino_available:
-            self.yolo_device = "intel:GPU"
         else:
-            self.yolo_device = "cpu"
+            self.yolo_device = resolve_yolo_device(cuda_available=self.cuda_available, openvino_available=self.openvino_available)
 
         if force_device == "cuda" or (not force_device and "CUDAExecutionProvider" in self.onnx_providers):
             self.onnx_provider = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -129,24 +145,24 @@ class GPUBackend:
         models_dir = os.path.join(project_root, "models")
         if self.cuda_available:
             return [
-                os.path.join(models_dir, "yolov8s.pt"),
-                os.path.join(project_root, "yolov8s.pt"),
-                os.path.join(models_dir, "yolov8s_openvino_model"),
-                os.path.join(project_root, "yolov8s_openvino_model"),
+                os.path.join(models_dir, "yolo12s.pt"),
+                os.path.join(project_root, "yolo12s.pt"),
+                os.path.join(models_dir, "yolo12s_openvino_model"),
+                os.path.join(project_root, "yolo12s_openvino_model"),
             ]
         elif self.openvino_available:
             return [
-                os.path.join(models_dir, "yolov8s_openvino_model"),
-                os.path.join(project_root, "yolov8s_openvino_model"),
-                os.path.join(models_dir, "yolov8s.pt"),
-                os.path.join(project_root, "yolov8s.pt"),
+                os.path.join(models_dir, "yolo12s_openvino_model"),
+                os.path.join(project_root, "yolo12s_openvino_model"),
+                os.path.join(models_dir, "yolo12s.pt"),
+                os.path.join(project_root, "yolo12s.pt"),
             ]
         else:
             return [
-                os.path.join(project_root, "yolov8s.pt"),
-                os.path.join(models_dir, "yolov8s.pt"),
-                os.path.join(models_dir, "yolov8s_openvino_model"),
-                os.path.join(project_root, "yolov8s_openvino_model"),
+                os.path.join(project_root, "yolo12s.pt"),
+                os.path.join(models_dir, "yolo12s.pt"),
+                os.path.join(models_dir, "yolo12s_openvino_model"),
+                os.path.join(project_root, "yolo12s_openvino_model"),
             ]
 
 

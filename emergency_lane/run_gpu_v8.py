@@ -1,32 +1,34 @@
 """
-高速公路应急车道违章检测系统 v8.0
+高速公路应急车道违章检测系统 v8.1
 ====================================
-流程：检测违章 → 剪裁30s片段 → 在剪辑上识别车牌+颜色+时间戳 → 生成报告
+流程：检测违章 → 剪裁15s片段 → 在剪辑上识别车牌+颜色+时间戳 → 生成报告
 
-新功能:
-1. 30s违章视频片段剪辑（保留违章前3s，删除>10s无违章段）
-2. 剪辑片段保存在原视频所在文件夹的子目录
-3. 报告中违章时间按片段时间标记（片段内第X秒）
-4. 视频右上角时间戳OCR提取
-5. 车牌颜色精准识别（蓝/黄/绿/白/黑5种）
-6. OpenVINO GPU全链路加速
+功能:
+1. YOLOv12s 目标检测
+2. 15s违章视频片段剪辑（保留违章前3s）
+3. 剪辑片段保存在原视频所在文件夹的子目录
+4. 报告中违章时间按片段时间标记（片段内第X秒）
+5. 视频右上角时间戳OCR提取
+6. 车牌颜色精准识别（蓝/黄/绿/白/黑5种）
+7. OpenVINO / CUDA GPU全链路加速
 """
 import cv2
 import numpy as np
 import os
+import shutil
 import sys
-import json
 import time
-import base64
 from collections import defaultdict
 from pathlib import Path
 from ultralytics import YOLO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils import compute_overlap, compute_iou, format_tc, fix_json_types
-from models.config import YOLO_MODEL_PATH, YOLO_DEVICE
-from gpu_backend import get_gpu_backend
+from utils import compute_overlap, compute_iou, format_tc
+from models.config import YOLO_MODEL_PATH
+from gpu_backend import get_gpu_backend, resolve_yolo_device
+from evidence_utils import cut_video_clip
+from report_utils import generate_html_report, dedupe_violations, write_manifest
 
 # =============================================
 # 配置
@@ -41,9 +43,8 @@ VIDEO_STEM = Path(VIDEO_PATH).stem
 
 # 输出目录：原视频所在文件夹的子目录
 OUTPUT_DIR = os.path.join(VIDEO_DIR, f"{VIDEO_STEM}_检测结果")
-CLIPS_DIR = os.path.join(OUTPUT_DIR, "举报视频片段")
-SNAPSHOT_DIR = os.path.join(OUTPUT_DIR, "违章截图")
-REPORT_HTML = os.path.join(OUTPUT_DIR, "违章检测报告.html")
+EVIDENCE_DIR = os.path.join(OUTPUT_DIR, "evidence")
+REPORT_HTML = os.path.join(OUTPUT_DIR, f"{VIDEO_STEM}_violation_report.html")
 
 LANE_START_X = 0.84
 MIN_OVERLAP = 0.25
@@ -52,12 +53,6 @@ DET_SCALE = 0.5
 CONFIRM_FRAMES = 3
 COOLDOWN_FRAMES = 150
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-
-# 30s剪辑参数
-CLIP_DURATION = 30       # 目标每段30秒
-PRE_VIOLATION_PAD = 3    # 违章前保留3秒
-MIN_GAP_TO_CUT = 10      # 无违章超过10秒可剪掉
-POST_VIOLATION_PAD = 5   # 违章后多留5秒
 
 # 中国车牌颜色分类
 PLATE_COLORS = {
@@ -69,8 +64,8 @@ PLATE_COLORS = {
 }
 
 print("=" * 60)
-print("  应急车道违章检测 v8.0")
-print("  GPU加速 | 30s剪辑 | 时间戳 | 车牌颜色")
+print("  应急车道违章检测 v8.1")
+print("  YOLOv12s | GPU加速 | 15s剪辑 | 时间戳 | 车牌颜色")
 print("=" * 60)
 
 
@@ -172,13 +167,13 @@ def extract_timestamp_ocr(frame):
     try:
         import pytesseract
         text = pytesseract.image_to_string(
-            binary, 
+            binary,
             config='--psm 7 -c tessedit_char_whitelist=0123456789:/-._ AMPP '
         )
         text = text.strip()
         if text and len(text) > 5:
             return text
-    except ImportError:
+    except Exception:
         pass
     
     return None
@@ -200,16 +195,16 @@ def extract_timestamp_from_video(frame, frame_idx, fps):
 print("\n[1/5] 加载模型...")
 
 if YOLO_MODEL_PATH is None:
-    print("  ❌ 未找到模型文件！请确保项目根目录下有 yolov8s.pt 或 yolov8s_openvino_model/")
+    print("  ❌ 未找到模型文件！请确保项目根目录下有 yolo12s.pt 或 yolo12s_openvino_model/")
     print("     或运行: python setup_models.py")
     sys.exit(1)
 gpu = get_gpu_backend()
 yolo = YOLO(YOLO_MODEL_PATH, task="detect")
-_yolo_device = gpu.yolo_device
+_yolo_device = resolve_yolo_device(YOLO_MODEL_PATH, cuda_available=gpu.cuda_available, openvino_available=gpu.openvino_available)
 dummy = np.zeros((848, 1920, 3), dtype=np.uint8)
 for _ in range(5):
     yolo.predict(dummy, conf=0.25, device=_yolo_device, classes=[2,3,5,7], verbose=False)
-print(f"  YOLOv8s {_yolo_device} ready")
+print(f"  YOLOv12s {_yolo_device} ready")
 
 if gpu.cuda_available:
     from lpr3_ort import LicensePlateCatcherORT
@@ -329,81 +324,15 @@ print(f"\n检测完成! 耗时: {elapsed_det:.1f}s ({elapsed_det/60:.1f}min)")
 print(f"检测到 {len(violations_raw)} 起违章")
 
 # =============================================
-# 3. 30s违章视频片段剪辑
+# 3. 15s违章视频片段剪辑
 # =============================================
-print(f"\n[3/5] 生成30s违章视频片段...")
+print(f"\n[3/5] 生成15s违章视频片段...")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(CLIPS_DIR, exist_ok=True)
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-
-# 计算剪辑片段时间段
-violation_times = sorted([v["timestamp_seconds"] for v in violations_raw])
-
-clips = []  # (start_sec, end_sec, label)
-
-if violation_times:
-    current_start = max(0, violation_times[0] - PRE_VIOLATION_PAD)
-    current_end = violation_times[0]
-    
-    for vt in violation_times[1:]:
-        gap = vt - current_end
-        if gap <= MIN_GAP_TO_CUT:
-            current_end = vt
-        else:
-            clips.append((current_start, current_end + POST_VIOLATION_PAD, f"clip_{len(clips)+1:02d}"))
-            current_start = max(0, vt - PRE_VIOLATION_PAD)
-            current_end = vt
-    
-    clips.append((current_start, min(current_end + POST_VIOLATION_PAD, video_duration), 
-                  f"clip_{len(clips)+1:02d}"))
-    
-    # 如果某段超过30秒，按违章点拆分，确保每段≤30秒
-    final_clips = []
-    for start, end, label in clips:
-        dur = end - start
-        if dur <= CLIP_DURATION:
-            final_clips.append((start, end, label))
-        else:
-            # 找出该段内的违章时间点
-            seg_violations = [vt for vt in violation_times if start <= vt <= end]
-            # 以违章点为中心，前后各留合适时间
-            seg_start = start
-            for si, vt in enumerate(seg_violations):
-                # 计算这段应该到哪里
-                ideal_end = vt + POST_VIOLATION_PAD
-                next_vt = seg_violations[si + 1] if si + 1 < len(seg_violations) else end
-                # 如果下一个违章很近，合并
-                if next_vt - vt <= MIN_GAP_TO_CUT:
-                    continue
-                # 否则到这里切
-                clip_end = min(ideal_end, seg_start + CLIP_DURATION)
-                if clip_end <= seg_start:
-                    clip_end = seg_start + CLIP_DURATION
-                clip_end = min(clip_end, end)
-                final_clips.append((seg_start, clip_end, f"{label}_p{si+1}"))
-                seg_start = max(next_vt - PRE_VIOLATION_PAD, clip_end)
-            
-            # 如果还有剩余
-            if seg_start < end:
-                final_clips.append((seg_start, end, f"{label}_p{len(seg_violations)+1}"))
-    
-    clips = final_clips
-
-print(f"  生成 {len(clips)} 个视频片段...")
-
-# 写剪辑视频（用FFmpeg直接剪切原视频流，不重新编码）
-for clip_idx, (start_sec, end_sec, label) in enumerate(clips):
-    dur = end_sec - start_sec
-    
-    clip_filename = f"{label}_{start_sec:.0f}s-{end_sec:.0f}s_{dur:.0f}s.mp4"
-    clip_path = os.path.join(CLIPS_DIR, clip_filename)
-    
-    # 用FFmpeg直接剪切，不重新编码（速度快，保持原始画质）
-    ffmpeg_cmd = f'ffmpeg -y -ss {start_sec:.2f} -i "{VIDEO_PATH}" -t {dur:.2f} -c copy "{clip_path}"'
-    os.system(ffmpeg_cmd + " >nul 2>&1")
-    
-    print(f"  片段 {clip_idx+1}: {start_sec:.0f}s-{end_sec:.0f}s ({dur:.0f}s) -> {clip_filename}")
+if os.path.isdir(EVIDENCE_DIR):
+    shutil.rmtree(EVIDENCE_DIR)
+os.makedirs(EVIDENCE_DIR, exist_ok=True)
+shutil.copy2(VIDEO_PATH, os.path.join(OUTPUT_DIR, os.path.basename(VIDEO_PATH)))
 
 # =============================================
 # 4. 在剪辑片段上识别车牌+颜色+时间戳
@@ -493,17 +422,6 @@ def recognize_plate(frame, bbox):
 
 t_p2 = time.time()
 violations = []
-
-# 计算每个违章属于哪个剪辑片段
-for vr in violations_raw:
-    vr["clip_index"] = -1
-    vr["clip_relative_time"] = None
-    for ci, (start_sec, end_sec, label) in enumerate(clips):
-        if start_sec <= vr["timestamp_seconds"] <= end_sec:
-            vr["clip_index"] = ci
-            vr["clip_relative_time"] = round(vr["timestamp_seconds"] - start_sec, 1)
-            vr["clip_label"] = label
-            break
 
 for i, vr in enumerate(violations_raw):
     fi = vr["frame"]
@@ -623,29 +541,60 @@ for i, vr in enumerate(violations_raw):
     print(f" {vr['plate_number']} ({vr['plate_color_name']}) {vr['plate_confidence']:.2f} "
           f"视频:{vr['video_time']} DVR:{vr['dvr_time']} {clip_time_str}")
     
-    # 生成违章截图（用识别到车牌的帧，而非违章检测帧）
-    snap = None
-    # 用最佳识别帧截图，确保截到车牌
-    cap.set(cv2.CAP_PROP_POS_FRAMES, best_frame_no)
-    ret_snap, frame_snap = cap.read()
-    if ret_snap:
-        snap = frame_snap
-        snap_fi = best_frame_no
-    elif ret:
-        snap = frame_at
-        snap_fi = fi
-    
-    if snap is not None:
-        sp = os.path.join(SNAPSHOT_DIR, f"violation_{i+1:03d}_{snap_fi:06d}.jpg")
-        # 用imencode避免中文路径问题
-        try:
-            _, buf = cv2.imencode('.jpg', snap, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            buf.tofile(sp)
-        except:
-            cv2.imwrite(sp, snap)
-        vr["snapshot"] = sp
-    
     violations.append(vr)
+
+cap.release()
+violations = dedupe_violations(violations, time_window=5.0)
+for violation in violations:
+    violation.pop("snapshot", None)
+    violation.pop("clip_path", None)
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+clip_results = []
+for index, violation in enumerate(violations, start=1):
+    plate_key = violation["plate_key"]
+    evidence_path = os.path.join(EVIDENCE_DIR, plate_key)
+    os.makedirs(evidence_path, exist_ok=True)
+
+    snap_frame = violation.get("best_frame", violation["frame"])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, snap_frame)
+    ret, frame = cap.read()
+    if not ret:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, violation["frame"])
+        ret, frame = cap.read()
+    if ret:
+        x1, y1, x2, y2 = map(int, violation["bbox"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        label = f'{violation["plate_number"]} ({violation["plate_confidence"]:.0%})'
+        cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+        snapshot_path = os.path.join(evidence_path, f'{plate_key}.jpg')
+        try:
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            buf.tofile(snapshot_path)
+        except Exception:
+            cv2.imwrite(snapshot_path, frame)
+        violation["snapshot"] = snapshot_path
+
+    clip_path = os.path.join(evidence_path, f'{plate_key}.mp4')
+    clip = cut_video_clip(VIDEO_PATH, clip_path, violation["timestamp_seconds"])
+    if clip is not None:
+        violation["clip_path"] = clip["path"]
+        violation["clip_label"] = plate_key
+        violation["clip_relative_time"] = round(violation["timestamp_seconds"] - clip["start"], 1)
+        clip_results.append({"index": index, "label": plate_key, **clip})
+
+    meta_path = os.path.join(evidence_path, 'meta.json')
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        import json
+        json.dump({
+            'plate': violation['plate_number'],
+            'plate_key': plate_key,
+            'time_seconds': violation['timestamp_seconds'],
+            'video_time': violation['video_time'],
+            'dvr_time': violation.get('dvr_time'),
+            'confidence': violation['plate_confidence'],
+            'plate_color_name': violation.get('plate_color_name'),
+        }, f, ensure_ascii=False, indent=2)
 
 cap.release()
 elapsed_p2 = time.time() - t_p2
@@ -662,110 +611,23 @@ for v in violations:
     pv[v["plate_number"]].append(v)
 
 plates_found = len([p for p in pv if p != "未识别"])
-
-color_html = {
-    "蓝牌": "#0052CC", "黄牌": "#F5A623", "绿牌": "#00B140",
-    "白牌": "#CCCCCC", "黑牌": "#333333", "未知": "#999999",
-}
-
-# 违章详情
-hv = ""
-for i, v in enumerate(violations):
-    p = v["plate_number"]
-    c = v.get("plate_confidence", 0)
-    pc = v.get("plate_color_name", "未知")
-    pc_html = color_html.get(pc, "#999")
-    dvr = v.get("dvr_time", "")
-    video_tc = v.get("video_time", "")
-    clip_rel = v.get("clip_relative_time")
-    clip_label = v.get("clip_label", "")
-    
-    sp = v.get("snapshot", "")
-    img = ""
-    if sp and os.path.exists(sp):
-        with open(sp, "rb") as f:
-            img = f'<img src="data:image/jpeg;base64,{base64.b64encode(f.read()).decode()}" style="max-width:800px;border:2px solid red;border-radius:8px;">'
-    
-    clr = "#c00" if p != "未识别" else "#999"
-    clip_info = f'片段 <b>{clip_label}</b> 第 <b>{clip_rel:.1f}秒</b>' if clip_rel is not None else '未归属片段'
-    
-    hv += f'''<div style="border:2px solid #ddd;margin:15px 0;padding:15px;border-radius:10px;background:#fff;">
-    <h3 style="color:#c00;margin:0 0 10px 0;">违章 #{i+1}</h3>
-    <table style="border:none;width:auto;"><tr>
-    <td style="border:none;padding:4px 12px;text-align:right;"><b>车牌号</b></td>
-    <td style="border:none;padding:4px 12px;"><span style="color:{clr};font-size:1.3em;font-weight:bold;">{p}</span>
-        <span style="display:inline-block;padding:2px 10px;border-radius:4px;background:{pc_html};color:white;font-weight:bold;margin-left:8px;">{pc}</span>
-    </td></tr>
-    <tr><td style="border:none;padding:4px 12px;text-align:right;"><b>置信度</b></td><td style="border:none;padding:4px 12px;">{c:.2f}</td></tr>
-    <tr><td style="border:none;padding:4px 12px;text-align:right;"><b>视频时间</b></td><td style="border:none;padding:4px 12px;">{video_tc}</td></tr>
-    {f'<tr><td style="border:none;padding:4px 12px;text-align:right;"><b>DVR时间</b></td><td style="border:none;padding:4px 12px;color:#0066cc;font-weight:bold;">{dvr}</td></tr>' if dvr else ''}
-    <tr><td style="border:none;padding:4px 12px;text-align:right;"><b>片段时间</b></td><td style="border:none;padding:4px 12px;">{clip_info}</td></tr>
-    </table>
-    {img}
-    </div>'''
-
-# 剪辑片段表
-clips_html = ""
-for ci, (start_sec, end_sec, label) in enumerate(clips):
-    dur = end_sec - start_sec
-    # 该片段包含的违章
-    clip_violations = [v for v in violations if v.get("clip_index") == ci]
-    plates_str = ", ".join(set(v["plate_number"] for v in clip_violations if v["plate_number"] != "未识别"))
-    clips_html += f'''<tr>
-        <td>{ci+1}</td>
-        <td>{label}</td>
-        <td>{start_sec:.0f}s - {end_sec:.0f}s</td>
-        <td>{dur:.0f}s</td>
-        <td style="color:#c00;font-weight:bold;">{plates_str or '-'}</td>
-    </tr>'''
-
-html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>违章检测报告 v8.0</title>
-<style>
-body {{ font-family: 'Microsoft YaHei', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
-.card {{ background: white; border-radius: 12px; padding: 20px; margin: 15px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-h1 {{ color: #c00; border-bottom: 3px solid #c00; padding-bottom: 10px; }}
-h2 {{ color: #2c3e50; }}
-table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
-th {{ background: #2c3e50; color: white; padding: 10px; text-align: center; }}
-td {{ padding: 8px; text-align: center; border-bottom: 1px solid #eee; }}
-tr:hover {{ background: #f0f0f0; }}
-</style></head>
-<body>
-<div class="card">
-<h1>🚨 应急车道违章检测报告</h1>
-<table>
-<tr><td style="text-align:right;width:120px;"><b>检测引擎</b></td><td>YOLOv8s + OpenVINO GPU (Intel Arc 140V)</td>
-    <td style="text-align:right;"><b>视频时长</b></td><td>{video_duration:.0f}秒</td></tr>
-<tr><td style="text-align:right;"><b>违章数</b></td><td style="color:#c00;font-weight:bold;">{len(violations)}</td>
-    <td style="text-align:right;"><b>识别车牌</b></td><td style="color:#27ae60;font-weight:bold;">{plates_found}</td></tr>
-<tr><td style="text-align:right;"><b>检测耗时</b></td><td>{elapsed_det:.0f}秒</td>
-    <td style="text-align:right;"><b>识别耗时</b></td><td>{elapsed_p2:.0f}秒</td></tr>
-<tr><td style="text-align:right;"><b>总耗时</b></td><td>{total_time:.0f}秒 ({total_time/60:.1f}分钟)</td>
-    <td style="text-align:right;"><b>剪辑片段</b></td><td>{len(clips)}个</td></tr>
-</table>
-</div>
-
-<div class="card">
-<h2>📋 违章详情</h2>
-{hv}
-</div>
-
-<div class="card">
-<h2>🎬 举报视频片段（约30秒）</h2>
-<p>片段保存在: <code>{CLIPS_DIR}</code></p>
-<table>
-<tr><th>#</th><th>标签</th><th>时间范围</th><th>时长</th><th>包含车牌</th></tr>
-{clips_html}
-</table>
-</div>
-</body></html>"""
-
-with open(REPORT_HTML, 'w', encoding='utf-8') as f:
-    f.write(html)
+write_manifest(violations, OUTPUT_DIR, VIDEO_PATH)
+html_path = generate_html_report(
+    violations,
+    VIDEO_PATH,
+    OUTPUT_DIR,
+    VIDEO_STEM,
+    LANE_START_X,
+    1.0 - LANE_START_X,
+    0.15,
+    clips=clip_results,
+    embed_snapshots=True,
+)
+REPORT_HTML = html_path
 
 print("\n" + "=" * 60)
 print(f"  检测: {elapsed_det:.0f}s | 识别: {elapsed_p2:.0f}s | 总: {total_time:.0f}s ({total_time/60:.1f}min)")
-print(f"  违章: {len(violations)} | 车牌: {plates_found} | 剪辑: {len(clips)}个")
+print(f"  违章: {len(violations)} | 车牌: {plates_found} | 视频: {len(clip_results)}个")
 print(f"\n  输出目录: {OUTPUT_DIR}")
 for p in sorted(p for p in pv if p != "未识别"):
     vs = pv[p]
@@ -773,7 +635,5 @@ for p in sorted(p for p in pv if p != "未识别"):
     pc = vs[0].get("plate_color_name", "?")
     dvr = vs[0].get("dvr_time", "")
     vt = vs[0]["video_time"]
-    clip_rel = vs[0].get("clip_relative_time")
-    clip_str = f" 片段{vs[0].get('clip_label','')}@{clip_rel:.1f}s" if clip_rel is not None else ""
-    print(f"  {p} ({pc}) 视频:{vt} DVR:{dvr}{clip_str} 置信度:{bc:.2f}")
+    print(f"  {p} ({pc}) 视频:{vt} DVR:{dvr} 置信度:{bc:.2f}")
 print("=" * 60)

@@ -257,11 +257,12 @@ class LicensePlateCatcherOV:
     完全兼容 HyperLPR3 的接口，但用 OpenVINO GPU 推理
     """
     
-    def __init__(self, device="GPU", det_level=1):
+    def __init__(self, device="GPU", det_level=1, allow_cpu_fallback=True):
         """
         Args:
             device: OpenVINO 设备 ("GPU", "CPU", "NPU", "AUTO")
             det_level: 0=低精度(320x), 1=高精度(640x)
+            allow_cpu_fallback: 是否允许回退到 CPU 版识别
         """
         if det_level == 0:
             det_path = os.path.expanduser("~/.hyperlpr3/20230229/onnx/y5fu_320x_sim.onnx")
@@ -270,7 +271,10 @@ class LicensePlateCatcherOV:
         
         self.detector = LPR3DetectorOV(det_path, device=device)
         self.recognizer = LPR3RecognizerOV(device=device)
-        self.classifier = LPR3ClassifierOV(device="CPU")  # 小模型CPU更快
+        # 当前流程直接使用检测模型输出的类别，不再额外初始化 CPU 分类模型，
+        # 这样在严格 GPU 模式下可避免任何 CPU 回退。
+        self.classifier = None
+        self.allow_cpu_fallback = allow_cpu_fallback
         self._fallback_catcher = None
     
     def _get_fallback(self):
@@ -321,7 +325,7 @@ class LicensePlateCatcherOV:
                 results.append([plate_text, np.float32(conf), int(ptype), [x1, y1, x2, y2]])
         
         # Fallback: 如果没识别出来，用原版
-        if not results:
+        if not results and self.allow_cpu_fallback:
             fallback = self._get_fallback()
             if fallback:
                 try:

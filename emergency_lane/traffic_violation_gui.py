@@ -18,7 +18,9 @@ from pathlib import Path
 # ============ 核心检测逻辑 ============
 
 from models.config import YOLO_MODEL_PATH, YOLO_DEVICE, PROJECT_ROOT
-from gpu_backend import get_gpu_backend
+from gpu_backend import get_gpu_backend, resolve_yolo_device
+from evidence_utils import cut_video_clip
+from report_utils import generate_html_report, dedupe_violations, write_manifest
 
 
 def _get_project_root():
@@ -27,7 +29,7 @@ def _get_project_root():
 
 
 def get_model_path():
-    """返回YOLOv8s模型路径（统一配置）"""
+    """返回 YOLOv12s 模型路径（统一配置）"""
     return YOLO_MODEL_PATH
 
 def ensure_model():
@@ -36,29 +38,65 @@ def ensure_model():
         return YOLO_MODEL_PATH
     return None
 
-def init_hyperlpr3():
-    """初始化车牌识别（OpenVINO GPU加速版）"""
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        gpu = get_gpu_backend()
+
+def _validate_gpu_model_path(model_path, device):
+    """校验模型格式与 GPU 设备是否匹配，避免静默回退到 CPU"""
+    model_path_lower = str(model_path).lower()
+    is_openvino_model = "_openvino_model" in model_path_lower
+    is_pt_model = model_path_lower.endswith(".pt")
+
+    if device == "intel:GPU" and not is_openvino_model:
+        raise RuntimeError(
+            "GPU加速已开启且当前使用的是 Intel/OpenVINO GPU，但检测模型不是 OpenVINO 导出模型。"
+            "请提供 yolo12s_openvino_model 后再开启 GPU 加速，或关闭该开关改用 CPU。"
+        )
+
+    if device == "cuda:0" and not is_pt_model:
+        raise RuntimeError(
+            "GPU加速已开启且当前使用的是 NVIDIA CUDA，但检测模型不是 .pt 模型。"
+            "请提供 yolo12s.pt 后再开启 GPU 加速，或关闭该开关改用 CPU。"
+        )
+
+def init_hyperlpr3(use_gpu=True):
+    """初始化车牌识别
+    use_gpu=True: 必须使用GPU，无GPU则报错
+    use_gpu=False: 使用CPU
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    gpu = get_gpu_backend()
+
+    if use_gpu:
+        # 强制GPU模式：必须有可用GPU
         if gpu.cuda_available:
             from lpr3_ort import LicensePlateCatcherORT
-            catcher = LicensePlateCatcherORT(det_level=1)
-        else:
+            return LicensePlateCatcherORT(
+                providers=["CUDAExecutionProvider"],
+                det_level=1,
+                allow_cpu_fallback=False,
+            )
+        elif gpu.openvino_available:
             from lpr3_openvino import LicensePlateCatcherOV
-            catcher = LicensePlateCatcherOV(device="GPU", det_level=1)
-        return catcher
-    except Exception as e:
-        # 回退到原版CPU
-        import hyperlpr3 as lpr3
-        zip_path = os.path.expanduser("~/.hyperlpr3/20230229.zip")
-        if os.path.exists(zip_path):
-            try:
-                os.remove(zip_path)
-            except:
-                pass
-        catcher = lpr3.LicensePlateCatcher(detect_level=lpr3.DETECT_LEVEL_HIGH)
-        return catcher
+            return LicensePlateCatcherOV(
+                device="GPU",
+                det_level=1,
+                allow_cpu_fallback=False,
+            )
+        else:
+            raise RuntimeError("GPU加速已开启但未检测到可用GPU（需要NVIDIA CUDA或Intel OpenVINO），请关闭GPU加速或安装GPU驱动")
+    else:
+        # CPU模式
+        try:
+            import hyperlpr3 as lpr3
+            zip_path = os.path.expanduser("~/.hyperlpr3/20230229.zip")
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except:
+                    pass
+            return lpr3.LicensePlateCatcher(detect_level=lpr3.DETECT_LEVEL_HIGH)
+        except Exception:
+            from lpr3_openvino import LicensePlateCatcherOV
+            return LicensePlateCatcherOV(device="CPU", det_level=1)
 
 def recognize_plate(catcher, img, bbox):
     """从图像中识别车牌"""
@@ -196,297 +234,229 @@ def multi_frame_recognize_with_frame(catcher, cap, frame_idx, vehicle_bbox, scan
         return best_plate, best_frame, plate_votes[best_plate]
     return None, frame_idx, 0
 
-def generate_violation_clips(video_path, violation_times, output_dir, progress_callback=None):
-    """根据违章时间点生成30秒视频片段（使用FFmpeg直接剪切，不重新编码）"""
-    if progress_callback is None:
-        progress_callback = lambda msg, pct: None
-
-    import shutil as _shutil
-    _ffmpeg_cmd = _shutil.which('ffmpeg')
-    if not _ffmpeg_cmd:
-        # Fallback: 检查常见安装路径
-        for _candidate in [r'C:\ffmpeg6.0\bin\ffmpeg.exe', r'C:\ffmpeg\bin\ffmpeg.exe']:
-            if os.path.isfile(_candidate):
-                _ffmpeg_cmd = _candidate
-                break
-    if not _ffmpeg_cmd:
-        progress_callback("  [ERROR] ffmpeg 未安装，无法生成视频片段。请安装 ffmpeg 并添加到 PATH。", -1)
-        return []
-
-    clip_duration = 30       # 目标每段30秒
-    pre_violation_pad = 3    # 违章前保留3秒
-    min_gap_to_cut = 10      # 无违章超过10秒可剪掉
-    post_violation_pad = 5   # 违章后多留5秒
-
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration = total_frames / fps if fps > 0 else 0
-    cap.release()
-
-    violation_times = sorted(violation_times)
-    clips = []  # (start_sec, end_sec, label)
-
-    if violation_times:
-        current_start = max(0, violation_times[0] - pre_violation_pad)
-        current_end = violation_times[0]
-
-        for vt in violation_times[1:]:
-            gap = vt - current_end
-            if gap <= min_gap_to_cut:
-                current_end = vt
-            else:
-                clips.append((current_start, current_end + post_violation_pad, f"clip_{len(clips)+1:02d}"))
-                current_start = max(0, vt - pre_violation_pad)
-                current_end = vt
-
-        clips.append((current_start, min(current_end + post_violation_pad, video_duration),
-                      f"clip_{len(clips)+1:02d}"))
-
-        # 如果某段超过30秒，按违章点拆分
-        final_clips = []
-        for start, end, label in clips:
-            dur = end - start
-            if dur <= clip_duration:
-                final_clips.append((start, end, label))
-            else:
-                seg_violations = [vt for vt in violation_times if start <= vt <= end]
-                seg_start = start
-                for si, vt in enumerate(seg_violations):
-                    ideal_end = vt + post_violation_pad
-                    next_vt = seg_violations[si + 1] if si + 1 < len(seg_violations) else end
-                    if next_vt - vt <= min_gap_to_cut:
-                        continue
-                    clip_end = min(ideal_end, seg_start + clip_duration)
-                    if clip_end <= seg_start:
-                        clip_end = seg_start + clip_duration
-                    clip_end = min(clip_end, end)
-                    final_clips.append((seg_start, clip_end, f"{label}_p{si+1}"))
-                    seg_start = max(next_vt - pre_violation_pad, clip_end)
-
-                if seg_start < end:
-                    final_clips.append((seg_start, end, f"{label}_p{len(seg_violations)+1}"))
-
-        clips = final_clips
-
-    clips_dir = os.path.join(output_dir, "举报视频片段")
-    os.makedirs(clips_dir, exist_ok=True)
-
-    clip_results = []
-    for clip_idx, (start_sec, end_sec, label) in enumerate(clips):
-        dur = end_sec - start_sec
-        clip_filename = f"{label}_{start_sec:.0f}s-{end_sec:.0f}s_{dur:.0f}s.mp4"
-        clip_path = os.path.join(clips_dir, clip_filename)
-
-        import subprocess as _sp
-        _result = _sp.run(
-            [_ffmpeg_cmd, '-y', '-ss', f'{start_sec:.2f}', '-i', video_path,
-             '-t', f'{dur:.2f}', '-c', 'copy', clip_path],
-            capture_output=True, text=True
-        )
-        if _result.returncode != 0:
-            progress_callback(f"  [WARN] FFmpeg failed for {clip_filename}: {_result.stderr[:200]}", -1)
-
-        clip_results.append({
-            'index': clip_idx + 1,
-            'label': label,
-            'start': start_sec,
-            'end': end_sec,
-            'duration': dur,
-            'filename': clip_filename,
-            'path': clip_path
-        })
-        progress_callback(f"  片段 {clip_idx+1}: {start_sec:.0f}s-{end_sec:.0f}s ({dur:.0f}s)", -1)
-
-    return clip_results
-
-
 def run_detection(video_path, lane_x=0.84, lane_width=0.16, lane_top=0.15,
-                  detection_scale=0.5, conf_threshold=0.5, use_gpu=True,
+                  detection_scale=0.75, conf_threshold=0.5, use_gpu=True,
+                  clip_duration=15,
                   progress_callback=None):
-    """运行应急车道违章检测，通过progress_callback报告进度"""
+    """运行应急车道违章检测，通过progress_callback报告进度
+    callback签名: (message, percent, stage_info=None)
+    stage_info: dict with keys like 'stage', 'model', 'gpu', etc.
+    """
 
     if progress_callback is None:
-        progress_callback = lambda msg, pct: None
-    
-    # 1. 初始化模型
-    progress_callback("正在加载YOLOv8模型...", 5)
+        progress_callback = lambda msg, pct, **kw: None
+
+    def _cb(msg, pct, **kwargs):
+        progress_callback(msg, pct, **kwargs)
+
+    start_time = time.time()
+
+    # ====== 阶段1: 加载模型 (0%-8%) ======
+    _cb("正在加载YOLOv12s模型...", 2, stage="加载模型")
     model_path = ensure_model()
     if not model_path:
-        raise RuntimeError("无法加载YOLOv8模型，请运行 python setup_models.py 下载模型")
+        raise RuntimeError("无法加载模型，请确保 yolo12s.pt 或 yolo12s_openvino_model 存在")
 
-    progress_callback(f"  模型路径: {model_path}", -1)
+    model_name = os.path.basename(model_path).replace('.pt', '').replace('_openvino_model', '')
 
     from ultralytics import YOLO
-    device = YOLO_DEVICE if use_gpu else "cpu"
+
+    gpu_backend = get_gpu_backend()
+    gpu_info = gpu_backend.backend_name
+    if gpu_backend.cuda_available:
+        gpu_info = f"CUDA ({gpu_backend.gpu_name})"
+    elif gpu_backend.openvino_available:
+        gpu_info = "OpenVINO GPU"
+
+    # 确定设备
+    if use_gpu:
+        if gpu_backend.cuda_available:
+            device = "cuda:0"
+        elif gpu_backend.openvino_available:
+            device = "intel:GPU"
+        else:
+            raise RuntimeError("GPU加速已开启但未检测到可用GPU（需要NVIDIA CUDA或Intel OpenVINO），请关闭GPU加速或安装GPU驱动")
+    else:
+        device = "cpu"
+
+    if use_gpu:
+        _validate_gpu_model_path(model_path, device)
+
     try:
         model = YOLO(model_path, task="detect")
-        progress_callback(f"  YOLOv8加载成功，设备: {device}", -1)
+        _cb(f"模型加载完成: {model_name} @ {device}", 5, stage="加载模型",
+            model=model_name, device=device, gpu=gpu_info)
     except Exception as e:
-        progress_callback(f"  OpenVINO加载失败({e})，回退CPU...", -1)
-        pt_path = os.path.join(_get_project_root(), "yolov8s.pt")
+        if use_gpu:
+            raise RuntimeError(f"GPU模型加载失败: {e}。请检查GPU驱动是否正常，或关闭GPU加速使用CPU模式")
+        _cb(f"模型加载失败({e})，尝试CPU回退...", 4, stage="加载模型")
+        pt_path = os.path.join(_get_project_root(), "yolo12s.pt")
         if os.path.exists(pt_path):
             model = YOLO(pt_path, task="detect")
             device = "cpu"
+            model_name = os.path.basename(pt_path).replace('.pt', '')
         else:
             raise
 
-    progress_callback("正在初始化车牌识别引擎...", 10)
-    catcher = init_hyperlpr3()
-    progress_callback("  车牌识别引擎就绪", -1)
-    
-    # 2. 打开视频
-    progress_callback("正在打开视频...", 15)
+    _cb("正在初始化车牌识别引擎...", 6, stage="加载模型")
+    catcher = init_hyperlpr3(use_gpu=use_gpu)
+    if use_gpu:
+        if gpu_backend.cuda_available:
+            lpr_name = "HyperLPR3 ONNXRuntime CUDA"
+        else:
+            lpr_name = "HyperLPR3 OpenVINO GPU"
+    else:
+        lpr_name = "HyperLPR3 CPU"
+    _cb(f"车牌引擎就绪: {lpr_name}", 8, stage="加载模型", lpr=lpr_name)
+
+    # ====== 阶段2: 打开视频 (8%-10%) ======
+    _cb("正在打开视频...", 9, stage="打开视频")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
-    
-    progress_callback(f"视频: {width}x{height} @ {fps:.0f}fps, {duration:.1f}秒, {total_frames}帧", 18)
-    
-    # 3. 检测循环
-    progress_callback("正在检测车辆...", 20)
-    
+
+    _cb(f"视频: {width}x{height} @ {fps:.0f}fps, {duration:.1f}秒, {total_frames}帧",
+        10, stage="打开视频")
+
+    # ====== 阶段3: 车辆检测 (10%-60%) ======
+    _cb("正在检测违章车辆...", 10, stage="车辆检测")
+
     emergency_lane_x = int(width * lane_x)
     emergency_lane_right = int(width * (lane_x + lane_width))
     emergency_lane_top = int(height * lane_top)
-    
-    # 跟踪违章车辆
-    tracked_violations = {}  # track_id -> {first_frame, bbox, plate, frames}
-    active_tracks = {}  # track_id -> last_seen_frame
+
+    tracked_violations = {}
+    active_tracks = {}
     violation_id_counter = 0
-    detection_interval = 3  # 每3帧检测一次
-    
-    start_time = time.time()
-    
+    detection_interval = 3
+
+    last_progress_time = time.time()
+
     for frame_idx in range(0, total_frames, detection_interval):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # 降采样检测
+
         if detection_scale < 1.0:
             small = cv2.resize(frame, (0, 0), fx=detection_scale, fy=detection_scale)
         else:
             small = frame
-        
-        # YOLO检测
-        results = model.predict(small, conf=conf_threshold, classes=[2, 5, 7], 
+
+        results = model.predict(small, conf=conf_threshold, classes=[2, 5, 7],
                                device=device, verbose=False, iou=0.45)
-        
-        if not results or len(results) == 0:
-            continue
-        
-        result = results[0]
-        if result.boxes is None or len(result.boxes) == 0:
-            continue
-        
-        # 处理检测框
-        boxes = result.boxes
-        for i in range(len(boxes)):
-            # 获取原始坐标
-            xyxy = boxes.xyxy[i].cpu().numpy()
-            x1 = int(xyxy[0] / detection_scale)
-            y1 = int(xyxy[1] / detection_scale)
-            x2 = int(xyxy[2] / detection_scale)
-            y2 = int(xyxy[3] / detection_scale)
-            conf = float(boxes.conf[i].cpu())
-            cls = int(boxes.cls[i].cpu())
-            track_id = int(boxes.id[i]) if boxes.id is not None else None
-            
-            # 检查是否在应急车道区域
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            
-            if cx >= emergency_lane_x and cx <= emergency_lane_right and cy >= emergency_lane_top:
-                # 使用简单的IoU跟踪
-                best_match = None
-                best_iou = 0.3
-                
-                for tid, info in list(active_tracks.items()):
-                    bx1, by1, bx2, by2 = info['bbox']
-                    # 计算IoU
-                    ix1 = max(x1, bx1)
-                    iy1 = max(y1, by1)
-                    ix2 = min(x2, bx2)
-                    iy2 = min(y2, by2)
-                    if ix2 > ix1 and iy2 > iy1:
-                        inter = (ix2 - ix1) * (iy2 - iy1)
-                        area1 = (x2 - x1) * (y2 - y1)
-                        area2 = (bx2 - bx1) * (by2 - by1)
-                        iou = inter / (area1 + area2 - inter)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_match = tid
-                
-                if best_match is not None:
-                    # 更新现有跟踪
-                    active_tracks[best_match]['bbox'] = (x1, y1, x2, y2)
-                    active_tracks[best_match]['frame'] = frame_idx
-                    if best_match in tracked_violations:
-                        tracked_violations[best_match]['last_frame'] = frame_idx
-                        tracked_violations[best_match]['bbox'] = (x1, y1, x2, y2)
-                else:
-                    # 新违章
-                    violation_id_counter += 1
-                    vid = f"V{violation_id_counter:03d}"
-                    tracked_violations[vid] = {
-                        'first_frame': frame_idx,
-                        'last_frame': frame_idx,
-                        'bbox': (x1, y1, x2, y2),
-                        'plate': None,
-                        'confidence': 0,
-                        'time': frame_idx / fps
-                    }
-                    active_tracks[vid] = {'bbox': (x1, y1, x2, y2), 'frame': frame_idx}
-        
-        # 清理长时间未见到的跟踪
+
+        if results and len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes
+            for i in range(len(boxes)):
+                xyxy = boxes.xyxy[i].cpu().numpy()
+                x1 = int(xyxy[0] / detection_scale)
+                y1 = int(xyxy[1] / detection_scale)
+                x2 = int(xyxy[2] / detection_scale)
+                y2 = int(xyxy[3] / detection_scale)
+                conf = float(boxes.conf[i].cpu())
+
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+
+                if cx >= emergency_lane_x and cx <= emergency_lane_right and cy >= emergency_lane_top:
+                    best_match = None
+                    best_iou = 0.3
+
+                    for tid, info in list(active_tracks.items()):
+                        bx1, by1, bx2, by2 = info['bbox']
+                        ix1 = max(x1, bx1)
+                        iy1 = max(y1, by1)
+                        ix2 = min(x2, bx2)
+                        iy2 = min(y2, by2)
+                        if ix2 > ix1 and iy2 > iy1:
+                            inter = (ix2 - ix1) * (iy2 - iy1)
+                            area1 = (x2 - x1) * (y2 - y1)
+                            area2 = (bx2 - bx1) * (by2 - by1)
+                            iou = inter / (area1 + area2 - inter)
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_match = tid
+
+                    if best_match is not None:
+                        active_tracks[best_match]['bbox'] = (x1, y1, x2, y2)
+                        active_tracks[best_match]['frame'] = frame_idx
+                        if best_match in tracked_violations:
+                            tracked_violations[best_match]['last_frame'] = frame_idx
+                            tracked_violations[best_match]['bbox'] = (x1, y1, x2, y2)
+                    else:
+                        violation_id_counter += 1
+                        vid = f"V{violation_id_counter:03d}"
+                        tracked_violations[vid] = {
+                            'first_frame': frame_idx,
+                            'last_frame': frame_idx,
+                            'bbox': (x1, y1, x2, y2),
+                            'plate': None,
+                            'confidence': 0,
+                            'time': frame_idx / fps
+                        }
+                        active_tracks[vid] = {'bbox': (x1, y1, x2, y2), 'frame': frame_idx}
+
         stale = [tid for tid, info in active_tracks.items() if frame_idx - info['frame'] > 30]
         for tid in stale:
             del active_tracks[tid]
-        
-        # 进度回调
-        pct = 20 + int(60 * frame_idx / total_frames)
-        elapsed = time.time() - start_time
-        eta = elapsed / (frame_idx + 1) * (total_frames - frame_idx) / detection_interval
-        progress_callback(
-            f"检测中: {frame_idx}/{total_frames}帧 ({frame_idx/total_frames*100:.0f}%) | "
-            f"已发现{len(tracked_violations)}起违章 | ETA: {eta:.0f}秒",
-            pct
-        )
-    
+
+        # 每秒最多更新2次进度（避免SSE风暴）
+        now = time.time()
+        if now - last_progress_time >= 0.5 or frame_idx + detection_interval >= total_frames:
+            last_progress_time = now
+            pct = 10 + int(50 * (frame_idx + 1) / total_frames)
+            elapsed = now - start_time
+            speed = (frame_idx + 1) / elapsed if elapsed > 0 else 0
+            eta = (total_frames - frame_idx - 1) / speed / 60 if speed > 0 else 0
+            _cb(
+                f"检测中: {frame_idx+1}/{total_frames}帧 ({(frame_idx+1)/total_frames*100:.0f}%) "
+                f"| 速度:{speed:.1f}fps | 已发现{len(tracked_violations)}起违章 "
+                f"| ETA:{eta:.1f}分钟",
+                pct,
+                stage="车辆检测",
+                frame=frame_idx+1,
+                total_frames=total_frames,
+                speed=round(speed, 1),
+                violations=len(tracked_violations),
+                eta_min=round(eta, 1)
+            )
+
     cap.release()
     det_elapsed = time.time() - start_time
-    progress_callback(f"车辆检测完成，耗时 {det_elapsed:.1f}秒，发现 {len(tracked_violations)} 起违章", -1)
+    _cb(f"车辆检测完成: {det_elapsed:.1f}秒, 发现{len(tracked_violations)}起违章",
+        60, stage="车辆检测")
 
-    # 4. 车牌识别阶段
+    # ====== 阶段4: 车牌识别 (60%-90%) ======
     violation_list = list(tracked_violations.items())
     n_violations = len(violation_list)
-    progress_callback(f"检测完成！发现{n_violations}起违章，开始识别车牌...", 82)
+    _cb(f"开始识别车牌 ({n_violations}起违章)...", 62, stage="车牌识别")
 
     cap = cv2.VideoCapture(video_path)
     t_plate_start = time.time()
 
     for i, (vid, vinfo) in enumerate(violation_list):
-        progress_callback(
+        pct = 62 + int(28 * (i + 1) / max(n_violations, 1))
+        _cb(
             f"[{i+1}/{n_violations}] 识别第{vinfo['first_frame']}帧车牌...",
-            82 + int(15 * (i + 1) / max(n_violations, 1))
+            pct,
+            stage="车牌识别",
+            plate_idx=i+1,
+            plate_total=n_violations
         )
 
-        # 记录最佳识别帧，默认为违章检测帧
         vinfo['best_frame'] = vinfo['first_frame']
 
-        # 先尝试当前帧直接识别
         cap.set(cv2.CAP_PROP_POS_FRAMES, vinfo['first_frame'])
         ret, frame = cap.read()
         if not ret:
-            progress_callback(f"  第{vinfo['first_frame']}帧读取失败，跳过", -1)
+            _cb(f"  第{vinfo['first_frame']}帧读取失败，跳过", -1, stage="车牌识别")
             continue
 
         t0 = time.time()
@@ -495,245 +465,149 @@ def run_detection(video_path, lane_x=0.84, lane_width=0.16, lane_top=0.15,
         if plate and conf > 0.5:
             vinfo['plate'] = plate
             vinfo['confidence'] = conf
-            progress_callback(f"  首帧识别成功: {plate} ({conf:.2f}) [{dt:.1f}秒]", -1)
+            _cb(f"  首帧识别成功: {plate} ({conf:.2f}) [{dt:.1f}秒]", -1, stage="车牌识别")
             continue
 
-        progress_callback(f"  首帧未识别 [{dt:.1f}秒]，多帧扫描中...", -1)
+        _cb(f"  首帧未识别 [{dt:.1f}秒]，多帧扫描中...", -1, stage="车牌识别")
         t0 = time.time()
         best_plate, best_frame, votes = multi_frame_recognize_with_frame(catcher, cap, vinfo['first_frame'], vinfo['bbox'], scan_range=30)
         dt = time.time() - t0
         if best_plate:
             vinfo['plate'] = best_plate
             vinfo['confidence'] = min(votes / 10, 1.0)
-            vinfo['best_frame'] = best_frame  # 记录最佳识别帧
-            progress_callback(f"  多帧扫描识别成功: {best_plate} (票数{votes}) [{dt:.1f}秒]", -1)
+            vinfo['best_frame'] = best_frame
+            _cb(f"  多帧扫描识别成功: {best_plate} (票数{votes}) [{dt:.1f}秒]", -1, stage="车牌识别")
         else:
-            progress_callback(f"  多帧扫描仍未识别 [{dt:.1f}秒]", -1)
+            _cb(f"  多帧扫描仍未识别 [{dt:.1f}秒]", -1, stage="车牌识别")
 
     plate_elapsed = time.time() - t_plate_start
-    progress_callback(f"车牌识别完成，耗时 {plate_elapsed:.1f}秒", 82)
+    _cb(f"车牌识别完成: {plate_elapsed:.1f}秒", 90, stage="车牌识别")
 
     cap.release()
 
-    # 5. 生成30秒违章视频片段
-    output_dir = os.path.dirname(video_path)
+    # ====== 阶段5: 生成证据和报告 (90%-100%) ======
+    output_dir = os.path.join(os.path.dirname(video_path), f"{Path(video_path).stem}_检测结果")
     video_name = Path(video_path).stem
+    evidence_dir = os.path.join(output_dir, "evidence")
 
-    violation_times = [vinfo['time'] for vinfo in tracked_violations.values()]
-    if violation_times:
-        progress_callback(f"正在生成30秒违章视频片段...", 85)
-        clips = generate_violation_clips(video_path, violation_times, output_dir, progress_callback)
-        progress_callback(f"  生成 {len(clips)} 个视频片段", -1)
-    else:
-        clips = []
+    os.makedirs(output_dir, exist_ok=True)
+    if os.path.isdir(evidence_dir):
+        import shutil
+        shutil.rmtree(evidence_dir)
+    os.makedirs(evidence_dir, exist_ok=True)
 
-    # 6. 生成结果
-    progress_callback("正在生成违章截图...", 95)
+    import shutil
+    shutil.copy2(video_path, os.path.join(output_dir, os.path.basename(video_path)))
+
+    _cb("正在生成证据文件...", 91, stage="生成报告")
 
     results = []
     for vid, vinfo in tracked_violations.items():
         timestamp = vinfo['time']
         mins = int(timestamp // 60)
         secs = int(timestamp % 60)
-
-        # 计算该违章属于哪个剪辑片段
-        clip_index = -1
-        clip_label = ""
-        clip_relative_time = None
-        for ci, clip in enumerate(clips):
-            if clip['start'] <= timestamp <= clip['end']:
-                clip_index = ci
-                clip_label = clip['label']
-                clip_relative_time = round(timestamp - clip['start'], 1)
-                break
-
         results.append({
             'id': vid,
             'plate': vinfo['plate'] or '未识别',
             'time': f"{mins:02d}:{secs:02d}",
             'time_seconds': timestamp,
             'frame': vinfo['first_frame'],
-            'best_frame': vinfo.get('best_frame', vinfo['first_frame']),  # 车牌识别最佳帧
+            'best_frame': vinfo.get('best_frame', vinfo['first_frame']),
             'bbox': list(vinfo['bbox']),
             'confidence': vinfo['confidence'],
-            'clip_index': clip_index,
-            'clip_label': clip_label,
-            'clip_relative_time': clip_relative_time
         })
-    
-    # 保存违章截图
-    snapshot_dir = os.path.join(output_dir, f"{video_name}_snapshots")
-    os.makedirs(snapshot_dir, exist_ok=True)
-    
+
+    results = dedupe_violations(results, time_window=5.0)
+
     cap = cv2.VideoCapture(video_path)
-    for r in results:
-        # 使用车牌识别最佳帧截图，确保截到车牌
-        snap_frame = r.get('best_frame', r['frame'])
+    clip_results = []
+    for index, result in enumerate(results, start=1):
+        plate_key = result['plate_key']
+        evidence_path = os.path.join(evidence_dir, plate_key)
+        os.makedirs(evidence_path, exist_ok=True)
+
+        _cb(f"  截图+视频: [{index}/{len(results)}] {plate_key}...",
+            91 + int(6 * index / max(len(results), 1)),
+            stage="生成报告")
+
+        snap_frame = result.get('best_frame', result['frame'])
         cap.set(cv2.CAP_PROP_POS_FRAMES, snap_frame)
         ret, frame = cap.read()
         if not ret:
-            # 回退到违章检测帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, r['frame'])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, result['frame'])
             ret, frame = cap.read()
         if ret:
-            # 绘制标注
-            x1, y1, x2, y2 = r['bbox']
+            x1, y1, x2, y2 = result['bbox']
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            label = f"{r['plate']} ({r['confidence']:.0%})"
+            label = f"{result['plate']} ({result['confidence']:.0%})"
             cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-            # 应急车道区域
             h, w = frame.shape[:2]
             cv2.rectangle(frame,
                          (int(w*lane_x), int(h*lane_top)),
                          (int(w*(lane_x+lane_width)), h),
                          (0, 255, 255), 2)
-
-            snap_path = os.path.join(snapshot_dir, f"violation_{r['id']}.jpg")
-            # 用imencode避免中文路径问题
+            snapshot_path = os.path.join(evidence_path, f'{plate_key}.jpg')
             try:
                 _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                buf.tofile(snap_path)
-            except:
-                cv2.imwrite(snap_path, frame)
-            r['snapshot'] = snap_path
+                buf.tofile(snapshot_path)
+            except Exception:
+                cv2.imwrite(snapshot_path, frame)
+            result['snapshot'] = snapshot_path
+
+        clip_path = os.path.join(evidence_path, f'{plate_key}.mp4')
+        clip = cut_video_clip(
+            video_path,
+            clip_path,
+            result['time_seconds'],
+            clip_duration=clip_duration,
+            progress_callback=progress_callback,
+        )
+        if clip is not None:
+            result['clip_path'] = clip['path']
+            result['clip_label'] = plate_key
+            result['clip_relative_time'] = round(result['time_seconds'] - clip['start'], 1)
+            clip_results.append({'index': index, 'label': plate_key, **clip})
+
+        meta_path = os.path.join(evidence_path, 'meta.json')
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            import json
+            json.dump({
+                'plate': result['plate'],
+                'plate_key': plate_key,
+                'time_seconds': result['time_seconds'],
+                'time': result['time'],
+                'confidence': result['confidence'],
+            }, f, ensure_ascii=False, indent=2)
+
     cap.release()
-    progress_callback(f"  截图已保存到 {snapshot_dir}", -1)
 
-    progress_callback("正在生成HTML报告...", 97)
-
-    # 生成HTML报告
+    _cb("正在生成HTML报告...", 98, stage="生成报告")
+    write_manifest(results, output_dir, video_path)
     html_path = generate_html_report(results, video_path, output_dir, video_name,
-                                      lane_x, lane_width, lane_top, clips)
+                                      lane_x, lane_width, lane_top, clip_results)
 
     total_time = time.time() - start_time
     recognized = sum(1 for r in results if r['plate'] != '未识别')
-    progress_callback(f"检测完成！违章{len(results)}起，识别{recognized}个车牌，{len(clips)}个视频片段，总耗时{total_time:.1f}秒", 100)
-    progress_callback(f"  HTML: {html_path}", -1)
+    _cb(f"检测完成! 共{len(results)}组证据, {recognized}个车牌, {len(clip_results)}个视频, 耗时{total_time:.0f}秒",
+        100, stage="完成")
 
     return {
         'violations': results,
         'html_path': html_path,
-        'snapshot_dir': snapshot_dir,
-        'clips': clips,
+        'evidence_dir': evidence_dir,
+        'clips': clip_results,
         'total_time': total_time,
         'total_violations': len(results),
-        'recognized_plates': sum(1 for r in results if r['plate'] != '未识别')
+        'recognized_plates': recognized,
+        'model_info': {
+            'model': model_name,
+            'device': device,
+            'gpu': gpu_info,
+            'lpr': lpr_name,
+            'video_info': f"{width}x{height}@{fps:.0f}fps",
+            'duration': round(duration, 1),
+        }
     }
-
-def generate_html_report(results, video_path, output_dir, video_name, lane_x, lane_width, lane_top, clips=None, base_url=None):
-    """生成HTML报告
-    base_url: 可选的基础URL前缀，用于Web服务模式（如 /task-files/{task_id}）
-              为None时使用相对路径（本地GUI模式）
-    """
-    html_path = os.path.join(output_dir, f"{video_name}_violation_report.html")
-
-    rows = ""
-    for r in results:
-        plate_color = "#27ae60" if r['plate'] != '未识别' else "#e74c3c"
-        snap = r.get('snapshot', '')
-        if snap and os.path.exists(snap):
-            if base_url:
-                snap_href = f"{base_url}/{os.path.relpath(snap, output_dir).replace(os.sep, '/')}"
-            else:
-                snap_href = os.path.relpath(snap, output_dir)
-            snap_link = f'<a href="{snap_href}" target="_blank">查看截图</a>'
-        else:
-            snap_link = '-'
-
-        # 片段信息
-        clip_info = ""
-        if r.get('clip_label') and r.get('clip_relative_time') is not None:
-            clip_info = f"片段{r['clip_label']} 第{r['clip_relative_time']:.1f}秒"
-
-        rows += f"""
-        <tr>
-            <td>{r['id']}</td>
-            <td style="color:{plate_color};font-weight:bold;font-size:1.2em">{r['plate']}</td>
-            <td>{r['time']}</td>
-            <td>{r['confidence']:.0%}</td>
-            <td>{clip_info if clip_info else '-'}</td>
-            <td>{snap_link}</td>
-        </tr>"""
-
-    # 剪辑片段表格
-    clips_html = ""
-    if clips:
-        clips_dir_name = "举报视频片段"
-        for clip in clips:
-            # 计算该片段包含的违章
-            clip_violations = [v for v in results if v.get('clip_label') == clip['label']]
-            plates_str = ", ".join(set(v['plate'] for v in clip_violations if v['plate'] != '未识别'))
-            if base_url:
-                clip_href = f"{base_url}/{clips_dir_name}/{clip['filename']}"
-            else:
-                clip_href = f"{clips_dir_name}/{clip['filename']}"
-            clips_html += f"""
-        <tr>
-            <td>{clip['index']}</td>
-            <td><a href="{clip_href}" target="_blank">{clip['filename']}</a></td>
-            <td>{clip['start']:.0f}s - {clip['end']:.0f}s</td>
-            <td>{clip['duration']:.0f}s</td>
-            <td style="color:#c00;font-weight:bold;">{plates_str or '-'}</td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<title>应急车道违章检测报告 - {video_name}</title>
-<style>
-body {{ font-family: 'Microsoft YaHei', sans-serif; max-width: 1000px; margin: 40px auto; background: #f5f5f5; }}
-.card {{ background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-h1 {{ color: #2c3e50; border-bottom: 3px solid #e74c3c; padding-bottom: 10px; }}
-h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 8px; margin-top: 30px; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-th {{ background: #2c3e50; color: white; padding: 12px; text-align: center; }}
-td {{ padding: 10px; text-align: center; border-bottom: 1px solid #eee; }}
-tr:hover {{ background: #f0f0f0; }}
-.stats {{ display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap; }}
-.stat {{ background: #ecf0f1; border-radius: 8px; padding: 15px 25px; text-align: center; }}
-.stat .num {{ font-size: 2em; font-weight: bold; color: #2c3e50; }}
-.stat .label {{ color: #7f8c8d; margin-top: 5px; }}
-a {{ color: #3498db; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>🚨 应急车道违章检测报告</h1>
-<p><strong>视频文件：</strong>{os.path.basename(video_path)}</p>
-<p><strong>检测时间：</strong>{time.strftime('%Y-%m-%d %H:%M:%S')}</p>
-<p><strong>应急车道区域：</strong>X={lane_x:.2f}, 宽度={lane_width:.2f}, 顶部={lane_top:.2f}</p>
-<div class="stats">
-    <div class="stat"><div class="num">{len(results)}</div><div class="label">违章总数</div></div>
-    <div class="stat"><div class="num" style="color:#27ae60">{sum(1 for r in results if r['plate'] != '未识别')}</div><div class="label">车牌识别成功</div></div>
-    <div class="stat"><div class="num" style="color:#e74c3c">{sum(1 for r in results if r['plate'] == '未识别')}</div><div class="label">未识别</div></div>
-    <div class="stat"><div class="num" style="color:#3498db">{len(clips) if clips else 0}</div><div class="label">视频片段</div></div>
-</div>
-</div>
-
-<div class="card">
-<h2>📋 违章详情</h2>
-<table>
-<tr><th>编号</th><th>车牌号</th><th>时间</th><th>置信度</th><th>视频片段</th><th>截图</th></tr>
-{rows}
-</table>
-</div>
-
-{"<div class='card'>" if clips else ""}
-{"<h2>🎬 举报视频片段（约30秒）</h2>" if clips else ""}
-{"<p>片段保存在: <code>举报视频片段</code> 子目录</p>" if clips else ""}
-{"<table><tr><th>#</th><th>文件名</th><th>时间范围</th><th>时长</th><th>包含车牌</th></tr>" if clips else ""}
-{clips_html}
-{"</table></div>" if clips else ""}
-</body>
-</html>"""
-
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html)
-
-    return html_path
-
 
 # ============ GUI 界面 ============
 
@@ -805,7 +679,7 @@ class TrafficViolationApp:
         adv_frame.grid(row=len(params), column=0, columnspan=2, sticky="w", pady=(8, 0))
         
         self.gpu_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(adv_frame, text="使用 Intel Arc GPU 加速", variable=self.gpu_var,
+        tk.Checkbutton(adv_frame, text="严格 GPU 模式", variable=self.gpu_var,
                        font=("Microsoft YaHei", 10), bg="white", fg="#555",
                        activebackground="white").pack(side=tk.LEFT)
         
@@ -816,11 +690,18 @@ class TrafficViolationApp:
                   textvariable=self.conf_var, width=5, font=("Consolas", 10),
                   bg="#fafafa", relief=tk.FLAT, bd=1).pack(side=tk.LEFT)
         
-        self.scale_var = tk.DoubleVar(value=0.5)
+        self.scale_var = tk.DoubleVar(value=0.75)
         tk.Label(adv_frame, text="  检测缩放:", font=("Microsoft YaHei", 10),
                 bg="white", fg="#555").pack(side=tk.LEFT, padx=(15, 5))
         tk.Spinbox(adv_frame, from_=0.25, to=1.0, increment=0.25,
                   textvariable=self.scale_var, width=5, font=("Consolas", 10),
+                  bg="#fafafa", relief=tk.FLAT, bd=1).pack(side=tk.LEFT)
+
+        self.clip_var = tk.IntVar(value=15)
+        tk.Label(adv_frame, text="  证据视频时长:", font=("Microsoft YaHei", 10),
+                bg="white", fg="#555").pack(side=tk.LEFT, padx=(15, 5))
+        tk.Spinbox(adv_frame, from_=5, to=60, increment=5,
+                  textvariable=self.clip_var, width=5, font=("Consolas", 10),
                   bg="#fafafa", relief=tk.FLAT, bd=1).pack(side=tk.LEFT)
         
         # ---- 控制按钮 ----
@@ -898,7 +779,7 @@ class TrafficViolationApp:
         bottom = tk.Frame(self.root, bg="#2c3e50", height=30)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
         bottom.pack_propagate(False)
-        self.bottom_label = tk.Label(bottom, text="Intel Arc 140V GPU | YOLOv8s + HyperLPR3 (OpenVINO) | 30s剪辑 + 车牌颜色 + 时间戳",
+        self.bottom_label = tk.Label(bottom, text="YOLOv12s | 严格 GPU 模式 | 15s剪辑 + 车牌颜色 + 时间戳",
                                      font=("Microsoft YaHei", 9), bg="#2c3e50", fg="#95a5a6")
         self.bottom_label.pack(pady=4)
     
@@ -960,6 +841,7 @@ class TrafficViolationApp:
                 detection_scale=self.scale_var.get(),
                 conf_threshold=self.conf_var.get(),
                 use_gpu=self.gpu_var.get(),
+                clip_duration=self.clip_var.get(),
                 progress_callback=self._progress_callback
             )
             self.result = result
@@ -967,7 +849,7 @@ class TrafficViolationApp:
         except Exception as e:
             self.root.after(0, self._on_detection_error, str(e))
     
-    def _progress_callback(self, msg, pct):
+    def _progress_callback(self, msg, pct, **kwargs):
         if not self.is_running:
             raise InterruptedError("用户停止了检测")
         self._log(msg)

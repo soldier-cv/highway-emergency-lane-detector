@@ -51,12 +51,14 @@ def encode_images(image, wh_ratio, input_size):
 
 
 
-def _get_providers():
+def _get_providers(allow_cpu_fallback=True):
     try:
         import onnxruntime as ort
         available = ort.get_available_providers()
         if 'CUDAExecutionProvider' in available:
-            return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            if allow_cpu_fallback:
+                return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            return ['CUDAExecutionProvider']
         return ['CPUExecutionProvider']
     except ImportError:
         return ['CPUExecutionProvider']
@@ -271,20 +273,27 @@ class LicensePlateCatcherORT:
     完全兼容 HyperLPR3 的接口，但用 ONNXRuntime CUDA 推理
     """
     
-    def __init__(self, providers=None, det_level=1):
+    def __init__(self, providers=None, det_level=1, allow_cpu_fallback=True):
         """
         Args:
             providers: ONNXRuntime providers (None=auto-detect)
             det_level: 0=低精度(320x), 1=高精度(640x)
+            allow_cpu_fallback: 是否允许回退到 CPU
         """
         if det_level == 0:
             det_path = HYPERLPR3_DET_MODEL_LOW
         else:
             det_path = HYPERLPR3_DET_MODEL
+
+        if providers is None:
+            providers = _get_providers(allow_cpu_fallback=allow_cpu_fallback)
         
         self.detector = LPR3DetectorORT(det_path, providers=providers)
         self.recognizer = LPR3RecognizerORT(providers=providers)
-        self.classifier = LPR3ClassifierORT(providers=['CPUExecutionProvider'])  # 小模型CPU更快
+        # 当前流程直接使用检测模型输出的类别，不再额外初始化 CPU 分类模型，
+        # 这样在严格 GPU 模式下可避免任何 CPU 回退。
+        self.classifier = None
+        self.allow_cpu_fallback = allow_cpu_fallback
         self._fallback_catcher = None
     
     def _get_fallback(self):
@@ -335,7 +344,7 @@ class LicensePlateCatcherORT:
                 results.append([plate_text, np.float32(conf), int(ptype), [x1, y1, x2, y2]])
         
         # Fallback: 如果没识别出来，用原版
-        if not results:
+        if not results and self.allow_cpu_fallback:
             fallback = self._get_fallback()
             if fallback:
                 try:

@@ -18,12 +18,12 @@ from pathlib import Path
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models"
-YOLO_DIR = MODELS_DIR / "yolov8"
+YOLO_DIR = MODELS_DIR / "yolo12"
 LPR_DIR = MODELS_DIR / "hyperlpr3"
 
 # YOLO模型 (从ultralytics自动下载)
 YOLO_MODELS = {
-    "yolov8s.pt": "yolov8s.pt",  # 默认小模型
+    "yolo12s.pt": "yolo12s.pt",
 }
 
 # HyperLPR3 ONNX模型
@@ -41,27 +41,27 @@ def check_yolo_model():
     print("-" * 40)
 
     # 检查项目本地
-    local_path = MODELS_DIR / "yolov8s.pt"
+    local_path = MODELS_DIR / "yolo12s.pt"
     if local_path.exists():
         size_mb = local_path.stat().st_size / 1024 / 1024
         print(f"  [OK] 本地: {local_path} ({size_mb:.1f}MB)")
         return True
 
     # 检查ultralytics缓存
-    cache_path = Path.home() / ".cache" / "ultralytics" / "yolov8s.pt"
+    cache_path = Path.home() / ".cache" / "ultralytics" / "yolo12s.pt"
     if cache_path.exists():
         size_mb = cache_path.stat().st_size / 1024 / 1024
         print(f"  [OK] 缓存: {cache_path} ({size_mb:.1f}MB)")
         return True
 
     # 检查项目根目录
-    root_path = PROJECT_ROOT / "yolov8s.pt"
+    root_path = PROJECT_ROOT / "yolo12s.pt"
     if root_path.exists():
         size_mb = root_path.stat().st_size / 1024 / 1024
         print(f"  [OK] 项目根: {root_path} ({size_mb:.1f}MB)")
         return True
 
-    print("  [!!] 未找到 yolov8s.pt")
+    print("  [!!] 未找到 yolo12s.pt")
     print("  首次运行时 ultralytics 会自动从网络下载")
     print("  或手动下载: https://github.com/ultralytics/assets/releases")
     return False
@@ -107,9 +107,9 @@ def check_lpr_models():
 
 def copy_yolo_to_local():
     """将YOLO模型复制到本地models/目录"""
-    cache_path = Path.home() / ".cache" / "ultralytics" / "yolov8s.pt"
-    root_path = PROJECT_ROOT / "yolov8s.pt"
-    local_path = MODELS_DIR / "yolov8s.pt"
+    cache_path = Path.home() / ".cache" / "ultralytics" / "yolo12s.pt"
+    root_path = PROJECT_ROOT / "yolo12s.pt"
+    local_path = MODELS_DIR / "yolo12s.pt"
 
     if local_path.exists():
         return True

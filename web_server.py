@@ -27,6 +27,8 @@ TEMPLATES_DIR = os.path.join(WEB_DIR, "templates")
 # 添加项目路径
 sys.path.insert(0, os.path.join(BASE_DIR, "emergency_lane"))
 
+from report_utils import generate_html_report
+
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
 
@@ -94,7 +96,7 @@ def load_tasks_from_disk():
 
             # 查找结果文件
             html_files = list(Path(task_path).glob('*_violation_report.html'))
-            snapshot_dirs = [d for d in Path(task_path).iterdir() if d.is_dir() and d.name.endswith('_snapshots')]
+            manifest_path = Path(task_path) / 'manifest.json'
 
             original_name = video_files[0].name if video_files else task_dir
             status = 'completed' if html_files else 'uploaded'
@@ -122,14 +124,20 @@ def load_tasks_from_disk():
                                 'size': os.path.getsize(file_path)
                             })
 
-                    clips_dir = task_path / "举报视频片段"
-                    clips_count = len(list(clips_dir.glob('*.mp4'))) if clips_dir.exists() else 0
+                    manifest = None
+                    if manifest_path.exists():
+                        import json
+                        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                    evidence_count = len(manifest.get('evidence', [])) if manifest else 0
+                    clips_count = sum(1 for item in (manifest.get('evidence', []) if manifest else []) if item.get('clip'))
 
                     result = {
-                        'total_violations': len(snapshot_dirs),
-                        'recognized_plates': 0,
+                        'total_violations': evidence_count,
+                        'recognized_plates': evidence_count,
                         'total_time': 0,
                         'clips_count': clips_count,
+                        'plates': [item.get('plate') for item in (manifest.get('evidence', []) if manifest else [])],
+                        'manifest_present': bool(manifest),
                         'files': result_files
                     }
                 except:
@@ -161,16 +169,42 @@ def run_detection_task(task_id, video_path, task_dir, params):
 
         os.makedirs(task_dir, exist_ok=True)
 
-        def progress_callback(msg, pct):
+        def progress_callback(msg, pct, **kwargs):
             if pct >= 0:
                 task['progress'] = pct
             task['message'] = msg
             if task_id in task_queues:
-                task_queues[task_id].put({
+                event_data = {
                     'type': 'progress',
                     'progress': pct,
                     'message': msg
-                })
+                }
+                # 附加阶段和详细信息
+                if kwargs.get('stage'):
+                    event_data['stage'] = kwargs['stage']
+                if kwargs.get('frame') is not None:
+                    event_data['frame'] = kwargs['frame']
+                if kwargs.get('total_frames') is not None:
+                    event_data['total_frames'] = kwargs['total_frames']
+                if kwargs.get('speed') is not None:
+                    event_data['speed'] = kwargs['speed']
+                if kwargs.get('violations') is not None:
+                    event_data['violations_count'] = kwargs['violations']
+                if kwargs.get('eta_min') is not None:
+                    event_data['eta_min'] = kwargs['eta_min']
+                if kwargs.get('model'):
+                    event_data['model'] = kwargs['model']
+                if kwargs.get('device'):
+                    event_data['device'] = kwargs['device']
+                if kwargs.get('gpu'):
+                    event_data['gpu'] = kwargs['gpu']
+                if kwargs.get('lpr'):
+                    event_data['lpr'] = kwargs['lpr']
+                if kwargs.get('plate_idx') is not None:
+                    event_data['plate_idx'] = kwargs['plate_idx']
+                if kwargs.get('plate_total') is not None:
+                    event_data['plate_total'] = kwargs['plate_total']
+                task_queues[task_id].put(event_data)
 
         from traffic_violation_gui import run_detection
 
@@ -186,9 +220,10 @@ def run_detection_task(task_id, video_path, task_dir, params):
             lane_x=params.get('lane_x', 0.84),
             lane_width=params.get('lane_width', 0.16),
             lane_top=params.get('lane_top', 0.15),
-            detection_scale=params.get('detection_scale', 0.5),
+            detection_scale=params.get('detection_scale', 0.75),
             conf_threshold=params.get('conf_threshold', 0.5),
             use_gpu=params.get('use_gpu', True),
+            clip_duration=params.get('clip_duration', 15),
             progress_callback=progress_callback
         )
 
@@ -202,40 +237,16 @@ def run_detection_task(task_id, video_path, task_dir, params):
             if html_path != dst:
                 shutil.move(html_path, dst)
 
-        # 移动截图目录
-        snapshot_src = result.get('snapshot_dir', '')
-        snapshot_dst = os.path.join(task_dir, f"{video_stem}_snapshots")
-        if snapshot_src and os.path.exists(snapshot_src):
-            if snapshot_src != snapshot_dst:
-                if os.path.exists(snapshot_dst):
-                    shutil.rmtree(snapshot_dst)
-                shutil.move(snapshot_src, snapshot_dst)
-        # 更新截图路径
-        for v in result.get('violations', []):
-            old_snap = v.get('snapshot', '')
-            if old_snap:
-                v['snapshot'] = os.path.join(snapshot_dst, os.path.basename(old_snap))
-
-        # 移动视频片段目录
-        clips_src = os.path.join(os.path.dirname(video_path), "举报视频片段")
-        if not os.path.exists(clips_src):
-            clips_src = os.path.join(os.path.dirname(dest_video), "举报视频片段")
-        if os.path.exists(clips_src):
-            clips_dst = os.path.join(task_dir, "举报视频片段")
-            if clips_src != clips_dst:
-                if os.path.exists(clips_dst):
-                    shutil.rmtree(clips_dst)
-                shutil.move(clips_src, clips_dst)
 
         # 重新生成HTML报告（使用Web服务URL，确保截图和视频链接正确）
-        from traffic_violation_gui import generate_html_report
         base_url = f"/task-files/{task_id}"
         html_report_path = os.path.join(task_dir, f"{video_stem}_violation_report.html")
         generate_html_report(
             result['violations'], dest_video, task_dir, video_stem,
             params.get('lane_x', 0.84), params.get('lane_width', 0.16),
             params.get('lane_top', 0.15), result.get('clips', []),
-            base_url=base_url
+            base_url=base_url,
+            embed_snapshots=False
         )
 
         # 生成结果文件列表（排除原始视频）
@@ -264,7 +275,10 @@ def run_detection_task(task_id, video_path, task_dir, params):
             'recognized_plates': result['recognized_plates'],
             'total_time': round(result['total_time'], 1),
             'clips_count': len(result.get('clips', [])),
-            'files': result_files
+            'plates': [v.get('plate') for v in result.get('violations', [])],
+            'manifest_present': True,
+            'files': result_files,
+            'model_info': result.get('model_info', {})
         }
 
         if task_id in task_queues:
@@ -433,6 +447,9 @@ def download_all(task_id):
     original_video = os.path.basename(task.get('video_path', ''))
     video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv'}
 
+    # 查找HTML报告并重新生成带相对路径的版本
+    html_files = list(Path(task_dir).glob('*_violation_report.html'))
+
     memory_file = io.BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(task_dir):
@@ -446,7 +463,15 @@ def download_all(task_id):
                     continue
                 file_path = os.path.join(root, file)
                 arcname = os.path.relpath(file_path, task_dir).replace('\\', '/')
-                zf.write(file_path, arcname)
+
+                # HTML报告：替换URL路径为相对路径，使解压后可直接打开
+                if file in [h.name for h in html_files]:
+                    content = open(file_path, 'r', encoding='utf-8').read()
+                    base_url_prefix = f"/task-files/{task_id}/"
+                    content = content.replace(base_url_prefix, '')
+                    zf.writestr(arcname, content)
+                else:
+                    zf.write(file_path, arcname)
 
     memory_file.seek(0)
     # 使用ASCII安全的文件名，通过Content-Disposition的filename*参数传递UTF-8文件名
@@ -481,6 +506,40 @@ def get_history():
 
     task_list.sort(key=lambda x: x['created_at'], reverse=True)
     return jsonify(task_list)
+
+
+@app.route('/api/model-info')
+def get_model_info():
+    """返回当前系统模型和GPU信息"""
+    try:
+        from gpu_backend import get_gpu_backend
+        from models.config import YOLO_MODEL_PATH
+        gpu = get_gpu_backend()
+
+        model_name = os.path.basename(YOLO_MODEL_PATH).replace('.pt', '').replace('_openvino_model', '') if YOLO_MODEL_PATH else '未找到'
+
+        info = {
+            'model': model_name,
+            'model_path': YOLO_MODEL_PATH,
+            'gpu': gpu.backend_name,
+            'cuda_available': gpu.cuda_available,
+            'openvino_available': gpu.openvino_available,
+            'gpu_name': gpu.gpu_name,
+            'gpu_memory_gb': gpu.gpu_memory_gb,
+            'yolo_device': gpu.yolo_device,
+            'onnx_provider': gpu.onnx_provider,
+        }
+
+        if gpu.cuda_available:
+            info['lpr'] = 'HyperLPR3 ONNXRuntime CUDA'
+        elif gpu.openvino_available:
+            info['lpr'] = 'HyperLPR3 OpenVINO GPU'
+        else:
+            info['lpr'] = 'HyperLPR3 CPU'
+
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/task/<task_id>', methods=['DELETE'])
